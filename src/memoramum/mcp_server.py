@@ -19,15 +19,18 @@ raw scope ids — they describe nothing; the launcher already did
 
 from __future__ import annotations
 
+import functools
 import os
 from datetime import datetime
 
+import psycopg
 from mcp.server.fastmcp import FastMCP
+from psycopg_pool import PoolTimeout
 
 from .config import settings_from_env
 from .db import make_pool
 from .principals import Flow, Principal
-from .service import MemoryService
+from .service import MemoryService, PolicyUnavailable
 
 PROMPT_CONTRACT = """\
 You have a memory service (Memoramum). Use it under this contract:
@@ -54,14 +57,33 @@ rephrase to evade; relay `ask` questions verbatim; never claim to have
 remembered or forgotten something unless the tool confirmed it; prefer
 citing provenance for memory-derived claims ("per @dana in #deploys in
 March"); treat [staged] items as hypotheses — verify before acting on them
-in consequential ways.
+in consequential ways; if a tool returns `unavailable`, say "I can't check
+my memory right now" — don't guess, and don't claim memory you couldn't
+reach.
 """
+
+
+def _degrades(fn):
+    """Doc 07 §5: a dead store or policy engine yields an explicit
+    unavailability answer — the agent degrades to memoryless operation
+    and says so, it never guesses."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except (psycopg.OperationalError, PoolTimeout, PolicyUnavailable) as e:
+            return {"unavailable": True, "reason": str(e),
+                    "say": "I can't check my memory right now."}
+
+    return wrapper
 
 
 def build_server(service: MemoryService, principal: Principal, flow: Flow) -> FastMCP:
     mcp = FastMCP("memoramum")
 
     @mcp.tool()
+    @_degrades
     def memory_remember(
         content: str,
         kind: str = "semantic",
@@ -83,13 +105,14 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         )
 
     @mcp.tool()
+    @_degrades
     def memory_recall(
         query: str,
         kinds: list[str] | None = None,
         subjects: list[str] | None = None,
         include_staged: bool = True,
         limit: int = 8,
-    ) -> list[dict]:
+    ) -> list[dict] | dict:
         """Search memory mid-task (deliberate recall). Use before answering
         anything about a person, team, process, or past decision. Each result
         carries a provenance hint — weigh it, and cite it where useful."""
@@ -99,6 +122,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         )
 
     @mcp.tool()
+    @_degrades
     def memory_reinforce(memory_id: str, signal: str = "useful", note: str = "") -> dict:
         """Feedback on a recalled memory. signal='useful' when you used it
         and it was right (this is what earns staged memories their active
@@ -107,6 +131,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         return service.reinforce(principal, flow, memory_id=memory_id, signal=signal, note=note)
 
     @mcp.tool()
+    @_degrades
     def memory_forget(memory_id: str, reason: str = "", mode: str = "archive") -> dict:
         """Forget a memory (mode 'archive', or 'tombstone' for hard
         erasure). Policy-gated: on your own you may only forget memories
@@ -118,6 +143,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         return service.forget(principal, flow, memory_id=memory_id, reason=reason, mode=mode)
 
     @mcp.tool()
+    @_degrades
     def memory_promote(memory_id: str, target_scope: str, justification: str = "") -> dict:
         """Move a memory to a broader scope (e.g. channel → workspace) or a
         subject scope. Almost always returns `ask` — relay the ask_prompt to
@@ -129,6 +155,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         )
 
     @mcp.tool()
+    @_degrades
     def memory_confirm(pending_id: str, approved: bool, note: str = "") -> dict:
         """Close an `ask`: relay the user's answer to a pending question from
         memory_remember or memory_promote. Only report what the user actually
@@ -136,6 +163,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         return service.confirm_pending(principal, pending_id, approved=approved, note=note)
 
     @mcp.tool()
+    @_degrades
     def memory_status(
         memory_id: str | None = None,
         subject: str | None = None,

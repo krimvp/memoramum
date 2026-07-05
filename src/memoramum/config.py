@@ -53,6 +53,13 @@ class Settings:
     # is near-orthogonal noise, so the default is deliberately high.
     outlier_distance: float = 0.9
 
+    # Membership-sync staleness bound (doc 07 §5): beyond this many seconds
+    # since a surface's last sync heartbeat, private-trust-class scopes on
+    # that surface fail closed and other reads note the staleness in their
+    # READ event. Only surfaces that heartbeat (membership_sync table) are
+    # bounded — membership authored directly in the service can't go stale.
+    membership_staleness_bound_seconds: int = 300
+
     # Erasure attestations (doc 06 §2.2 step 5) are HMAC-signed with this
     # key; a real deployment injects one (MEMORAMUM_ATTESTATION_KEY).
     attestation_key: str = field(

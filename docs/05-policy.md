@@ -132,7 +132,7 @@ readable(S) =  enrolled(agent, S)                       -- reader_agent on S or 
             ∧  ( user is NULL  ∨  member(user, S) )      -- on-behalf-of user could see the source
 ```
 
-The **intersection rule** implements the source-visibility invariant ([doc 01 §3.2](01-concepts-and-scopes.md)): an agent enrolled org-wide still cannot recall channel-scoped memories for a user who isn't in that channel. Membership for surface containers is checked at retrieval time — against a near-real-time sync of surface membership (with the surface's own API as the authority for cache-miss/verification). Membership *changes* invalidate nothing at rest; they simply change what the next read returns.
+The **intersection rule** implements the source-visibility invariant ([doc 01 §3.2](01-concepts-and-scopes.md)): an agent enrolled org-wide still cannot recall channel-scoped memories for a user who isn't in that channel. Membership for surface containers is checked at retrieval time — against a near-real-time sync of surface membership (with the surface's own API as the authority for cache-miss/verification). Membership *changes* invalidate nothing at rest; they simply change what the next read returns. Syncing surfaces heartbeat a per-surface watermark after each cycle; retrieval enforces the [doc 07 §5](07-operations.md) staleness bound against it (membership authored directly in the service has no sync to go stale).
 
 Subject scopes: `owner` (the subject) always reads; agents need `reader_agent` enrollment *and* the subject's user-preference layer not opting out; other humans read only via audit/DSAR roles.
 

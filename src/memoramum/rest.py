@@ -12,13 +12,14 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .config import Settings, settings_from_env
 from .db import make_pool
 from .principals import Flow, Principal, PrincipalError
-from .service import AccessDenied, MemoryService, NotFound
+from .service import AccessDenied, MemoryService, NotFound, PolicyUnavailable
 
 
 def principal_from_headers(
@@ -60,6 +61,10 @@ class EpisodeRequest(BaseModel):
     content: str | None = None
     author: str | None = None
     occurred_at: datetime | None = None
+
+
+class MembershipSyncRequest(BaseModel):
+    surface: str                        # heartbeat after each sync cycle (doc 07 §5)
 
 
 class ScopeRequest(BaseModel):
@@ -155,6 +160,21 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
     async def _bad(request: Request, exc: ValueError):
         raise HTTPException(status_code=400, detail=str(exc))
 
+    # Doc 07 §5: fail closed, and say so. A dead policy engine refuses
+    # writes (queue and retry); a dead store degrades surfaces to
+    # memoryless operation — the context block is optional enrichment.
+    @app.exception_handler(PolicyUnavailable)
+    async def _policy_down(request: Request, exc: PolicyUnavailable):
+        raise HTTPException(status_code=503, detail=str(exc),
+                            headers={"Retry-After": "30"})
+
+    @app.exception_handler(psycopg.OperationalError)
+    async def _store_down(request: Request, exc: psycopg.OperationalError):
+        raise HTTPException(
+            status_code=503, headers={"Retry-After": "30"},
+            detail="memory service unavailable — degrade to memoryless operation (doc 07 §5)",
+        )
+
     @app.get("/healthz")
     def healthz():
         return {"ok": True, "phase": "P4"}
@@ -183,6 +203,11 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
             occurred_at=body.occurred_at,
         )
 
+    @app.post("/v1/membership-sync")
+    def membership_sync(body: MembershipSyncRequest,
+                        principal: Principal = Depends(principal_from_headers)):
+        return svc.record_membership_sync(principal, surface=body.surface)
+
     @app.get("/v1/memories/{memory_id}")
     def get_memory(memory_id: str, principal: Principal = Depends(principal_from_headers)):
         return svc.get_memory(principal, memory_id)
@@ -209,6 +234,10 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
             principal, action=action, actor=actor, memory_id=memory_id,
             scope_id=scope_id, limit=limit,
         )
+
+    @app.get("/v1/metrics")
+    def metrics(days: int = 30, principal: Principal = Depends(principal_from_headers)):
+        return svc.metrics(principal, days=days)
 
     @app.get("/v1/episodes/{episode_id}")
     def get_episode(episode_id: str, principal: Principal = Depends(principal_from_headers)):

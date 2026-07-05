@@ -40,7 +40,9 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import erasure, events, lifecycle, pii, policy, retrieval, scopes
+import psycopg
+
+from . import erasure, events, lifecycle, observability, pii, policy, retrieval, scopes
 from .config import Settings
 from .embedding import make_embedder
 from .principals import Flow, Principal
@@ -77,6 +79,11 @@ class AccessDenied(PermissionError):
 
 class NotFound(LookupError):
     pass
+
+
+class PolicyUnavailable(Exception):
+    """Doc 07 §5: the policy engine is unreachable. Writes fail closed —
+    the caller queues and retries; nothing is stored without a verdict."""
 
 
 class MemoryService:
@@ -117,6 +124,26 @@ class MemoryService:
                 details={"relation": relation, "principal": target,
                          "change": "remove" if remove else "add"},
             )
+
+    def record_membership_sync(self, principal: Principal, *, surface: str) -> dict:
+        """Membership-sync heartbeat (doc 05 §4.1, doc 07 §5): ingestion
+        reports each completed sync of a surface's membership; retrieval
+        holds reads to the staleness bound against this watermark."""
+        if not surface:
+            raise ValueError("surface is required")
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            if not (principal.kind == "system" or self._is_org_admin(cur, principal)):
+                raise AccessDenied(
+                    "membership-sync heartbeats belong to platform ingestion (doc 07 §1)"
+                )
+            row = cur.execute(
+                "INSERT INTO membership_sync (surface, synced_at) VALUES (%s, now())"
+                " ON CONFLICT (surface) DO UPDATE SET synced_at = now()"
+                " RETURNING surface, synced_at",
+                (surface,),
+            ).fetchone()
+            return _plain(row)
 
     # ---------- platform: episodes ----------
 
@@ -172,8 +199,8 @@ class MemoryService:
             if any(e.kind == "credential" for e in entities) and "credentials" not in categories:
                 categories.append("credentials")
 
-            layers = self._layers(cur, agent=principal.actor, surface=flow.surface,
-                                  subjects=subjects)
+            layers = self._layers_for_write(cur, agent=principal.actor, surface=flow.surface,
+                                            subjects=subjects)
             verdict = policy.evaluate(layers, policy.Candidate(
                 kind=kind, categories=tuple(categories), origin_kind=origin_kind,
                 subjects=tuple(subjects), participants=tuple(flow.participants),
@@ -515,9 +542,9 @@ class MemoryService:
             prov = cur.execute(
                 "SELECT origin_kind FROM memory_provenance WHERE memory_id=%s", (memory_id,)
             ).fetchone()
-            layers = self._layers(cur, agent=principal.actor,
-                                  surface=flow.surface or source["surface"],
-                                  subjects=mem["subject_ids"])
+            layers = self._layers_for_write(cur, agent=principal.actor,
+                                            surface=flow.surface or source["surface"],
+                                            subjects=mem["subject_ids"])
             gate = policy.promotion_gate(layers, crossing=crossing,
                                          source_trust_class=source["trust_class"])
             # …plus the write-into-destination evaluation (doc 05 §3). A
@@ -637,9 +664,9 @@ class MemoryService:
                 if pipeline.blocked:
                     raise ValueError(f"the candidate no longer passes the PII pipeline:"
                                      f" {pipeline.block_reason}")
-                layers = self._layers(cur, agent=requester.actor,
-                                      surface=payload.get("surface"),
-                                      subjects=payload["subjects"])
+                layers = self._layers_for_write(cur, agent=requester.actor,
+                                                surface=payload.get("surface"),
+                                                subjects=payload["subjects"])
                 verdict = policy.Verdict(
                     "ask", payload.get("rule_id", "ask"), "confirmed by the user", {},
                     ttl_days=payload.get("ttl_days"),
@@ -1321,7 +1348,7 @@ class MemoryService:
             if as_of is not None and not scopes.is_auditor(cur, principal, self.settings.org_scope_id):
                 raise AccessDenied("as-of queries are an audit feature (doc 05 §4.2)")
             chain = scopes.resolve_chain(cur, principal, flow)
-            rp = self._read_policy(cur, principal, flow)
+            chain, rp, noted = self._degraded_read(cur, principal, flow, chain)
             hits = retrieval.search(
                 cur, scope_chain=chain, query=query,
                 query_embedding=self.embedder.embed(query), settings=self.settings,
@@ -1332,7 +1359,7 @@ class MemoryService:
                 as_of=as_of, limit=limit,
             )
             self._deliver(cur, principal, flow, [str(h["id"]) for h in hits],
-                          path="deliberate", extra={"query": query})
+                          path="deliberate", extra={"query": query, **noted})
             return [self._present(cur, h) for h in hits]
 
     def context_block(
@@ -1344,7 +1371,7 @@ class MemoryService:
         with self.pool.connection() as conn:
             cur = conn.cursor()
             chain = scopes.resolve_chain(cur, principal, flow)
-            rp = self._read_policy(cur, principal, flow)
+            chain, rp, noted = self._degraded_read(cur, principal, flow, chain)
             hits = retrieval.search(
                 cur, scope_chain=chain, query=focus,
                 query_embedding=self.embedder.embed(focus) if focus else None,
@@ -1385,7 +1412,7 @@ class MemoryService:
             block_id = str(uuid.uuid4())
             self._deliver(cur, principal, flow, delivered, path="ambient",
                           extra={"context_block_id": block_id, "focus": focus,
-                                 "token_budget": token_budget})
+                                 "token_budget": token_budget, **noted})
             return {"block_id": block_id, "block": "\n".join(lines), "memory_ids": delivered}
 
     def status(
@@ -1489,6 +1516,18 @@ class MemoryService:
             ).fetchall()
             return _plain(rows)
 
+    def metrics(self, principal: Principal, *, days: int = 30) -> dict:
+        """The doc 07 §4 "metrics that matter", computed from the store
+        (observability.py, ADR-0008). Reading them is reading operational
+        aggregates over the whole org, so the gate matches the event log's:
+        org-admin or auditor."""
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            if not (self._is_org_admin(cur, principal)
+                    or scopes.is_auditor(cur, principal, self.settings.org_scope_id)):
+                raise AccessDenied("metrics require org-admin or auditor privileges (doc 07 §4)")
+            return observability.snapshot(cur, self.settings, days=days)
+
     def get_episode(self, principal: Principal, episode_id: str) -> dict:
         with self.pool.connection() as conn:
             cur = conn.cursor()
@@ -1558,6 +1597,39 @@ class MemoryService:
             elif layer_name == "org":
                 layers.append(policy.BUILTIN_ORG_LAYER)
         return layers
+
+    def _layers_for_write(self, cur, **kw) -> list[policy.PolicyLayer]:
+        """Doc 07 §5: policy engine unreachable → fail closed for writes.
+        No layer stack, no verdict, nothing stored."""
+        try:
+            return self._layers(cur, **kw)
+        except psycopg.Error as e:
+            raise PolicyUnavailable(
+                f"policy layers unreadable ({e}); write refused — queue and retry (doc 07 §5)"
+            ) from e
+
+    def _degraded_read(self, cur, principal: Principal, flow: Flow,
+                       chain: list[str]) -> tuple[list[str], policy.ReadPolicy, dict]:
+        """The doc 07 §5 read-side degradations, applied to a resolved chain.
+
+        Membership sync stale beyond the bound: private surface scopes drop
+        from the chain (fail closed), the rest serve with the staleness
+        noted in the READ event. Policy engine unreachable: fail closed for
+        reads beyond the principal's own agent scope, under the built-in
+        org baseline. The returned dict rides into the READ event details.
+        """
+        noted: dict[str, Any] = {}
+        stale = scopes.membership_staleness_seconds(cur, flow.surface)
+        if stale is not None and stale > self.settings.membership_staleness_bound_seconds:
+            chain = [s for s in chain if s not in scopes.synced_private(cur, chain)]
+            noted["membership_staleness_seconds"] = round(stale)
+        try:
+            rp = self._read_policy(cur, principal, flow)
+        except psycopg.Error:
+            chain = [s for s in chain if s == principal.actor]
+            rp = policy.read_policy([policy.BUILTIN_ORG_LAYER])
+            noted["policy_degraded"] = True
+        return chain, rp, noted
 
     def _read_policy(self, cur, principal: Principal, flow: Flow) -> policy.ReadPolicy:
         """The merged read-side attribute rules for this agent/surface
