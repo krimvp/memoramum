@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memoramum — design overview</title>
+<meta name="description" content="High-level overview of Memoramum: a standalone, auditable, policy-governed memory service for AI agents.">
+<style>
+  :root {
+    --bg: #faf9f7; --panel: #ffffff; --ink: #1f2430; --muted: #5b6472;
+    --line: #e3e0da; --accent: #7c5cff; --accent-ink: #4b34c4;
+    --ok: #1a7f4b; --warn: #b3690a; --deny: #b3362d; --stage: #8a6d00;
+    --code-bg: #f2f0ec; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161c; --panel: #1c1f27; --ink: #e8e6e1; --muted: #9aa2af;
+      --line: #2c303b; --accent: #9d85ff; --accent-ink: #baa8ff;
+      --ok: #4cc38a; --warn: #e0a458; --deny: #e5726a; --stage: #d4b106;
+      --code-bg: #232733;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 900px; margin: 0 auto; padding: 3rem 1.25rem 5rem; }
+  h1 { font-size: 2.2rem; line-height: 1.15; margin: 0 0 .4rem; letter-spacing: -.02em; }
+  h2 { font-size: 1.35rem; margin: 3rem 0 .75rem; letter-spacing: -.01em;
+       border-bottom: 1px solid var(--line); padding-bottom: .35rem; }
+  h3 { font-size: 1.02rem; margin: 1.4rem 0 .4rem; }
+  p  { margin: .6rem 0; }
+  a  { color: var(--accent-ink); }
+  .kicker { color: var(--accent-ink); font-weight: 600; text-transform: uppercase;
+            font-size: .78rem; letter-spacing: .12em; }
+  .lede { font-size: 1.12rem; color: var(--muted); max-width: 46rem; }
+  .muted { color: var(--muted); }
+  small.note { display: block; color: var(--muted); margin-top: .5rem; }
+  code, pre { font-family: var(--mono); font-size: .86em; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px;
+    padding: 1rem 1.2rem; overflow-x: auto; line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; }
+
+  .grid { display: grid; gap: .9rem; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin: 1.2rem 0; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 1rem 1.1rem;
+  }
+  .card h3 { margin: 0 0 .35rem; font-size: .98rem; }
+  .card p { margin: 0; font-size: .92rem; color: var(--muted); }
+
+  .pill { display: inline-block; font-family: var(--mono); font-size: .78rem;
+          border: 1px solid var(--line); border-radius: 999px; padding: .1rem .6rem;
+          margin: 0 .15rem .3rem 0; background: var(--panel); white-space: nowrap; }
+  .pill.ok    { color: var(--ok);    border-color: var(--ok); }
+  .pill.stage { color: var(--stage); border-color: var(--stage); }
+  .pill.warn  { color: var(--warn);  border-color: var(--warn); }
+  .pill.deny  { color: var(--deny);  border-color: var(--deny); }
+
+  .flow { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem;
+          margin: 1rem 0; font-family: var(--mono); font-size: .82rem; }
+  .flow .step { background: var(--panel); border: 1px solid var(--line);
+                border-radius: 8px; padding: .35rem .7rem; }
+  .flow .arrow { color: var(--muted); }
+  .flow .step.hot { border-color: var(--accent); }
+
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { text-align: left; padding: .5rem .7rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .tablewrap { overflow-x: auto; }
+
+  ol.scenario { counter-reset: s; list-style: none; padding: 0; margin: 1rem 0; }
+  ol.scenario li {
+    counter-increment: s; position: relative; padding: .55rem 0 .55rem 3rem;
+    border-left: 2px solid var(--line); margin-left: 1rem;
+  }
+  ol.scenario li::before {
+    content: counter(s); position: absolute; left: -1rem; top: .65rem;
+    width: 2rem; height: 2rem; border-radius: 50%; display: grid; place-items: center;
+    background: var(--panel); border: 2px solid var(--accent); color: var(--accent-ink);
+    font-weight: 700; font-size: .9rem;
+  }
+  ol.scenario b { display: inline-block; min-width: 0; }
+
+  footer { margin-top: 4rem; padding-top: 1rem; border-top: 1px solid var(--line);
+           color: var(--muted); font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <span class="kicker">Design overview</span>
+  <h1>Memoramum</h1>
+  <p class="lede">A standalone <strong>memory service for AI agents</strong> — a Slack assistant,
+  an MR-review bot, tomorrow's surfaces — that lets them <strong>learn, remember, and forget</strong>
+  under explicit policy, with every memory auditable from the moment it was proposed to the
+  moment it was erased.</p>
+  <p class="muted">This page is the two-minute version. The normative design lives in the
+  <a href="README.md">README</a> and <a href="docs/01-concepts-and-scopes.md">docs 01–07</a>.</p>
+
+  <h2>The bet</h2>
+  <p>Agents without memory re-ask everything. Agents with <em>naive</em> memory are worse: they
+  hoard stale facts, leak across contexts, and can be poisoned by anything they read. Existing
+  systems (Letta, Mem0, Zep, LangMem) each solve pieces; none treats
+  <strong>provenance, scoped access control, and governance</strong> as the core. Memoramum does:</p>
+  <div class="grid">
+    <div class="card"><h3>🔍 Auditable by construction</h3>
+      <p>Every memory knows its source messages, its actor, and its justification. Every write
+      <em>and every read into an agent's context</em> is an event in an append-only log —
+      "why did the bot say that?" is a query, not forensics.</p></div>
+    <div class="card"><h3>🎯 Scoped by default</h3>
+      <p>A memory learned in a channel belongs to that channel. Wider visibility is an explicit,
+      policied, audited <strong>promotion</strong> — never a side effect.</p></div>
+    <div class="card"><h3>⚖️ Governed by policy</h3>
+      <p>A layered policy engine decides what each agent may learn, where it routes, what it may
+      read, and what needs a human. Default deny: no policy, no learning.</p></div>
+    <div class="card"><h3>🍂 Forgetting is a feature</h3>
+      <p>Memories decay out of retrieval, get superseded on contradiction, expire on TTL, and can
+      be hard-erased GDPR-style — leaving a content-free tombstone in the audit trail.</p></div>
+  </div>
+
+  <h2>Architecture in one diagram</h2>
+  <pre><code>  Slack events ──▶      ┌──────────────── MEMORAMUM ────────────────┐
+  GitLab webhooks ──▶    │  Ingestion ──▶ episodes (verbatim sources) │
+                         │                                            │
+  agents ◀── MCP tools ──┤  MCP facade ─┐                             │
+  platform ◀── REST ─────┤  REST facade ┼─▶ API core ──▶ one Postgres │
+  review UI ◀────────────┤              │      │        (memories,    │
+                         │        policy engine│         episodes,    │
+                         │                     │         events,      │
+                         │  job queue ─▶ extraction workers  scopes,  │
+                         │            ─▶ consolidator        policy)  │
+                         │            ─▶ sweeps (decay/TTL/erasure)   │
+                         └────────────────────────────────────────────┘</code></pre>
+  <p>Design choices behind the shape: it is a <strong>standalone service</strong> so policy and
+  audit are unbypassable — no agent embeds the storage layer (ADR-0005). Agents speak
+  <strong>MCP</strong> (six tools: <code>memory_recall</code>, <code>memory_remember</code>,
+  <code>memory_reinforce</code>, <code>memory_forget</code>, <code>memory_promote</code>,
+  <code>memory_status</code>); platform code uses REST. Everything lives in <strong>one
+  Postgres</strong> (+pgvector) so a memory, its provenance, its policy decision, and its audit
+  event commit in a single transaction (ADR-0004). Background workers — extraction, the
+  <strong>consolidator</strong>, sweeps — produce memory <em>quality</em> offline so the hot path
+  stays fast.</p>
+
+  <h2>Core concepts</h2>
+  <h3>Memories</h3>
+  <p>The atomic unit: one short natural-language claim ("Team Atlas deploys to production only on
+  Tuesdays") with exactly one <em>kind</em>, one <em>scope</em>, one lifecycle <em>status</em>, and
+  full provenance back to verbatim <strong>episodes</strong> (the exact Slack message or MR
+  comment it came from). Content is immutable — corrections create a <em>successor</em> and close
+  the predecessor's validity window.</p>
+  <div class="grid">
+    <div class="card"><h3><code>semantic</code></h3><p>Facts, preferences, constraints. Superseded on contradiction.</p></div>
+    <div class="card"><h3><code>episodic</code></h3><p>What happened; lessons kept as exemplars. Decays fastest.</p></div>
+    <div class="card"><h3><code>procedural</code></h3><p>How the agent should behave. Highest-risk kind — writes usually require a human.</p></div>
+    <div class="card"><h3><code>profile</code></h3><p>Bounded per-subject document (timezone, preferences). The one update-in-place exception.</p></div>
+  </div>
+
+  <h3>Scopes — who can see what</h3>
+  <p>Every memory lives in <strong>exactly one scope</strong>; scopes form a tree plus two
+  parallel families:</p>
+  <pre><code>org:acme
+├── surface:slack
+│   └── workspace/T024B ── channel/C0DEP ── thread/…     (container scopes)
+├── surface:gitlab
+│   └── project/platform-api ── mr/482
+├── subject:user/dana        (about a person, cross-surface — the GDPR family)
+└── agent:sage               (an agent's private notebook)</code></pre>
+  <p>A read resolves a <strong>scope chain</strong> — thread → channel → workspace → org, plus
+  the subject scopes of participants and the agent's own scope — computed server-side from the
+  agent's declared context; agents can't ask for arbitrary scopes. The
+  <strong>source-visibility invariant</strong> (Slack's contract, adopted wholesale): a memory
+  never surfaces to someone who couldn't see its source episodes, <em>checked at retrieval
+  time</em>. Cross-surface sharing isn't a mechanism of its own — it's just placement in a scope
+  both surfaces can read, reached by promotion.</p>
+
+  <h2>How a write works</h2>
+  <div class="flow">
+    <span class="step">candidate memory</span><span class="arrow">→</span>
+    <span class="step">classify<br><span class="muted">categories · sensitivity · PII scan</span></span><span class="arrow">→</span>
+    <span class="step hot">policy layers<br><span class="muted">org → surface → agent → user-pref</span></span><span class="arrow">→</span>
+    <span class="step">verdict</span><span class="arrow">→</span>
+    <span class="step">store + <code>POLICY_DECISION</code> event</span>
+  </div>
+  <p>Every write resolves to one of four verdicts, layers composing <em>strictest-wins</em>
+  (an agent-level allow can never beat an org-level ask):</p>
+  <p>
+    <span class="pill ok">allow — written active</span>
+    <span class="pill stage">stage — usable but quarantined</span>
+    <span class="pill warn">ask — a human confirms first</span>
+    <span class="pill deny">deny — refused, still logged</span>
+  </p>
+  <p>The default is <strong>staged</strong>: agent-inferred memories are immediately useful but
+  rank-penalized, visibly fenced in context blocks, and unable to overwrite trusted memories.
+  They earn <code>active</code> through <strong>reinforcement</strong> — independent
+  re-observation, useful retrievals, or explicit confirmation. Only an explicit user "remember
+  this" skips staging. This is also the poisoning defense: injected "memories" die at the policy
+  gate or sit quarantined until corroborated by independent evidence.</p>
+
+  <h2>Life of a memory</h2>
+  <div class="flow">
+    <span class="step stage">staged</span><span class="arrow">— reinforcement →</span>
+    <span class="step hot">active</span><span class="arrow">— pin →</span>
+    <span class="step">invariant</span>
+  </div>
+  <div class="flow">
+    <span class="step hot">active</span><span class="arrow">— contradiction →</span>
+    <span class="step">deprecated</span><span class="arrow">— decay / TTL →</span>
+    <span class="step">archived</span><span class="arrow">— erasure →</span>
+    <span class="step deny">tombstoned</span>
+  </div>
+  <p>Two clocks run independently: lifecycle <em>status</em> (the system's operational stance) and
+  <strong>bi-temporal validity</strong> — when a fact was true in the world
+  (<code>valid_at</code>/<code>invalid_at</code>) versus when the system learned it
+  (<code>recorded_at</code>). Contradictions never edit or delete: they close the old memory's
+  validity window and link a successor, so "what did we believe in April?" and "when did the
+  deploy policy change?" both stay answerable.</p>
+  <p>Forgetting is retrieval-side first: an Ebbinghaus retention curve
+  <code>R&nbsp;=&nbsp;exp(−t/S)</code> multiplies into every retrieval score, so unused memories
+  fade before anything touches rows. Reinforcement bumps strength <code>S</code>; frequently
+  useful memories become effectively permanent. Hard paths — user "forget that", provenance-based
+  quarantine, TTL, GDPR erasure — physically delete content and embeddings and leave a
+  content-free tombstone event.</p>
+
+  <h2>How agents read</h2>
+  <div class="tablewrap"><table>
+    <tr><th>Path</th><th>Who initiates</th><th>What it does</th></tr>
+    <tr><td><strong>Ambient recall</strong></td><td>Platform, at session/turn start</td>
+        <td>Service assembles a bounded context block for the scope chain: invariants first, then
+        active facts, then a clearly-fenced <code>[staged]</code> section — every line with a
+        provenance hint.</td></tr>
+    <tr><td><strong>Deliberate recall</strong></td><td>The agent, mid-task</td>
+        <td><code>memory_recall</code> with a natural-language query — hybrid vector + lexical
+        retrieval, scored by relevance × retention × trust × status × scope proximity.</td></tr>
+  </table></div>
+  <p>Access control runs <em>before</em> scoring (never post-filtering), and every delivery emits
+  a <code>READ</code> event listing the memories that entered context (ADR-0006) — the one log most
+  systems skip, and the only way to answer "why did the bot say that?".</p>
+
+  <h2>The worked scenario</h2>
+  <p class="muted">One story threads through every doc — Sage (Slack agent), Marge (MR-review
+  agent), and dana:</p>
+  <ol class="scenario">
+    <li><b>Learn.</b> Sage observes dana in <code>#deploys</code>: "Team Atlas deploys to production
+      only on Tuesdays." Policy says <span class="pill stage">stage</span> → stored scoped to that
+      channel, provenance pointing at dana's exact message.</li>
+    <li><b>Reinforce.</b> Re-observed two weeks later and retrieved usefully → the consolidator
+      promotes it to <span class="pill ok">active</span>.</li>
+    <li><b>Promote.</b> dana asks Sage to share it with the other teams. Channel → workspace crosses
+      into a shared scope → <span class="pill warn">ask</span> → dana confirms → audited promotion.</li>
+    <li><b>Cross-surface recall.</b> Marge, reviewing an MR that schedules a Friday deploy, resolves
+      her scope chain (repo → org + shared scopes), retrieves the memory, and flags the conflict.</li>
+    <li><b>Forget.</b> Months later: "we've moved to daily deploys." Contradiction closes the old
+      memory's validity window, links a successor; the old fact stops surfacing but stays queryable
+      as history.</li>
+    <li><b>Audit.</b> "Why did Marge warn about Tuesdays on MR !482?" — the READ event, the memory,
+      its promotion, its reinforcements, and dana's original message are one traversal away.</li>
+  </ol>
+
+  <h2>Where the ideas come from</h2>
+  <p>Deliberately assembled from proven pieces: bi-temporal supersession from
+  <strong>Zep/Graphiti</strong>, background "sleep-time" consolidation from
+  <strong>Letta</strong>, extraction pipelines from <strong>Mem0</strong>, the memory-kind
+  taxonomy from <strong>LangMem</strong>/CoALA, retrieval-time access checks from
+  <strong>Slack AI</strong>, layered allow/ask/deny policy from <strong>Claude Code</strong>.
+  The novel part is the combination: provenance, scoped access, and governance as the spine
+  rather than bolt-ons. See the
+  <a href="docs/appendix-prior-art.md">prior-art appendix</a> and the six
+  <a href="docs/adr/">ADRs</a> for the contested calls.</p>
+
+  <footer>
+    <p><strong>Read next:</strong> <a href="README.md">README</a> (pitch, scenario, glossary) →
+    <a href="docs/01-concepts-and-scopes.md">01 concepts &amp; scopes</a> →
+    <a href="docs/02-data-model.md">02 data model</a> →
+    <a href="docs/03-lifecycle.md">03 lifecycle</a> →
+    <a href="docs/04-agent-interface.md">04 agent interface</a> →
+    <a href="docs/05-policy.md">05 policy</a> →
+    <a href="docs/06-audit-privacy-security.md">06 audit, privacy &amp; security</a> →
+    <a href="docs/07-operations.md">07 operations</a></p>
+    <p>Design documentation only — there is no implementation yet. This page is a summary; the
+    Markdown docs are normative.</p>
+  </footer>
+</main>
+</body>
+</html>
