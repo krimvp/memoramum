@@ -210,6 +210,10 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
             scope_id=scope_id, limit=limit,
         )
 
+    @app.get("/v1/metrics")
+    def metrics(days: int = 30, principal: Principal = Depends(principal_from_headers)):
+        return svc.metrics(principal, days=days)
+
     @app.get("/v1/episodes/{episode_id}")
     def get_episode(episode_id: str, principal: Principal = Depends(principal_from_headers)):
         return svc.get_episode(principal, episode_id)

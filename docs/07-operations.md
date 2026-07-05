@@ -63,10 +63,11 @@ Decision recorded in [ADR-0004](adr/0004-postgres-reference-stack.md); summary:
 | Multi-hop questions become common ("who owns the service dana's team deploys on Tuesdays?") and flat-fact retrieval visibly fails them | temporal knowledge graph layer (Graphiti-style entity/edge extraction) *on top of* episodes — the episode+provenance design was chosen to make this additive, not a migration |
 | Multi-tenancy | tenant becomes a physical boundary (schema- or cluster-per-tenant), ReBAC moves to a real engine |
 | Policy conditions outgrow the declarative shape | promote the OPA sidecar from escape hatch to standard path |
+| Store-derived metrics snapshots ([ADR-0008](adr/0008-metrics-from-the-store.md)) get slow at event volume, or trend/alerting needs outgrow point-in-time reads | materialize the aggregates (rollup tables refreshed by a sweep), or put a time-series exporter in front of `GET /v1/metrics`; the endpoint shape stays |
 
 ## 4. Observability & SLOs
 
-**Metrics that matter** (beyond standard service health):
+**Metrics that matter** (beyond standard service health) — computed from the store rather than from process counters, and served as one snapshot at `GET /v1/metrics` ([doc 04 §5](04-agent-interface.md); decision recorded in [ADR-0008](adr/0008-metrics-from-the-store.md)):
 
 - *Retrieval quality*: recall-into-context rate that gets reinforced (useful-read ratio); staged-tier precision (fraction of staged memories eventually promoted vs archived — the health of the extraction pipeline); contradiction-queue depth and age.
 - *Policy*: decisions by verdict per agent (a spike in `deny` = misconfigured agent or an attack; a spike in `ask` = user-fatigue risk); time-to-confirm for `ask`s.

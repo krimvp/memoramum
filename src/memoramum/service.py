@@ -40,7 +40,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import erasure, events, lifecycle, pii, policy, retrieval, scopes
+from . import erasure, events, lifecycle, observability, pii, policy, retrieval, scopes
 from .config import Settings
 from .embedding import make_embedder
 from .principals import Flow, Principal
@@ -1488,6 +1488,18 @@ class MemoryService:
                 params,
             ).fetchall()
             return _plain(rows)
+
+    def metrics(self, principal: Principal, *, days: int = 30) -> dict:
+        """The doc 07 §4 "metrics that matter", computed from the store
+        (observability.py, ADR-0008). Reading them is reading operational
+        aggregates over the whole org, so the gate matches the event log's:
+        org-admin or auditor."""
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            if not (self._is_org_admin(cur, principal)
+                    or scopes.is_auditor(cur, principal, self.settings.org_scope_id)):
+                raise AccessDenied("metrics require org-admin or auditor privileges (doc 07 §4)")
+            return observability.snapshot(cur, self.settings, days=days)
 
     def get_episode(self, principal: Principal, episode_id: str) -> dict:
         with self.pool.connection() as conn:

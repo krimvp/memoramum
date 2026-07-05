@@ -22,7 +22,8 @@ src/memoramum/                reference implementation, P4 (ADR-0007):
                               docs 01/02/05/04; lifecycle.py = the doc 03 rules (judge,
                               reinforcement, promotion); pii.py = the doc 06 §4 pipeline;
                               extraction.py = the doc 07 §1 workers; consolidator.py = the
-                              full doc 07 §2 job set; erasure.py = the doc 06 §2 pipeline
+                              full doc 07 §2 job set; erasure.py = the doc 06 §2 pipeline;
+                              observability.py = the doc 07 §4 metrics (ADR-0008)
 tests/                        integration tests against real Postgres, incl. the P1–P4 exit
                               criteria of doc 07 §6 (test_worked_scenario.py = the full
                               6-step scenario across Slack + GitLab)
@@ -40,7 +41,7 @@ docs/
                               PII pipeline
   07-operations.md            components, consolidator jobs, reference stack, SLOs, rollout
   appendix-prior-art.md       survey of Letta, Mem0, Zep/Graphiti, LangMem, etc.
-  adr/000N-*.md               one-page records of the contested decisions (7 so far)
+  adr/000N-*.md               one-page records of the contested decisions (8 so far)
 ```
 
 Read `README.md` first, then docs in numeric order — each ends with a "Continue with"

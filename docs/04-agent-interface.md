@@ -193,5 +193,6 @@ The contract is persuasive; the *enforcement* is server-side policy ([doc 05](05
 | `GET /v1/quarantine` / `POST /v1/quarantine/{id}` | quarantined-lineage review: restore or tombstone ([doc 06 §3](06-audit-privacy-security.md)) |
 | `POST /v1/agents/{agent}/freeze` | break-glass write-freeze ([doc 05 §5](05-policy.md)) |
 | `GET /v1/audit/events` | filtered event-log queries (admin) |
+| `GET /v1/metrics` | the [doc 07 §4](07-operations.md) metrics, one store-derived snapshot (admin/auditor; [ADR-0008](adr/0008-metrics-from-the-store.md)) |
 
 Continue with [doc 05 — Policy](05-policy.md): the layer that decides every verdict this interface returns.
