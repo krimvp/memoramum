@@ -102,6 +102,42 @@ class SimulationRequest(BaseModel):
     days: int = 30
 
 
+class ForgetRequest(BaseModel):
+    reason: str = ""
+    mode: str = "archive"               # archive | tombstone (doc 03 §6)
+
+
+class ErasureRequest(BaseModel):
+    subject: str                        # 'user:dana'
+    legal_basis: str = "gdpr_art_17"
+    note: str = ""
+
+
+class QuarantineRequest(BaseModel):
+    """The source predicate of doc 06 §3: episode source, author, agent,
+    time window — any combination, at least one."""
+
+    episode_id: str | None = None
+    author: str | None = None
+    source_kind: str | None = None
+    agent: str | None = None
+    scope_id: str | None = None
+    occurred_from: datetime | None = None
+    occurred_to: datetime | None = None
+    note: str = ""
+
+
+class QuarantineResolution(BaseModel):
+    memory_id: str
+    action: str                         # restore | tombstone
+    note: str = ""
+
+
+class FreezeRequest(BaseModel):
+    frozen: bool
+    reason: str = ""
+
+
 def create_app(service: MemoryService | None = None, settings: Settings | None = None) -> FastAPI:
     settings = settings or settings_from_env()
     svc = service or MemoryService(make_pool(settings.database_url), settings)
@@ -121,7 +157,7 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
 
     @app.get("/healthz")
     def healthz():
-        return {"ok": True, "phase": "P3"}
+        return {"ok": True, "phase": "P4"}
 
     @app.post("/v1/context-block")
     def context_block(
@@ -247,15 +283,50 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
             invalid_at=body.invalid_at, note=body.note,
         )
 
-    # --- later-phase surface, kept visible and honest ---
+    # --- forgetting & incident response (doc 03 §6, doc 06 §2–3) ---
+
+    @app.post("/v1/memories/{memory_id}/forget")
+    def forget_memory(memory_id: str, body: ForgetRequest,
+                      principal: Principal = Depends(principal_from_headers)):
+        return svc.forget(principal, Flow(), memory_id=memory_id,
+                          reason=body.reason, mode=body.mode)
 
     @app.post("/v1/erasure-requests")
-    def erasure_requests():
-        raise HTTPException(status_code=501, detail="erasure pipeline arrives in P4 (doc 07 §6)")
+    def request_erasure(body: ErasureRequest,
+                        principal: Principal = Depends(principal_from_headers)):
+        return svc.request_erasure(principal, subject=body.subject,
+                                   legal_basis=body.legal_basis, note=body.note)
+
+    @app.get("/v1/erasure-requests/{request_id}")
+    def erasure_request(request_id: str,
+                        principal: Principal = Depends(principal_from_headers)):
+        return svc.erasure_request(principal, request_id)
 
     @app.post("/v1/quarantine")
-    def quarantine():
-        raise HTTPException(status_code=501, detail="quarantine tooling arrives in P4 (doc 07 §6)")
+    def quarantine(body: QuarantineRequest,
+                   principal: Principal = Depends(principal_from_headers)):
+        return svc.quarantine(
+            principal, episode_id=body.episode_id, author=body.author,
+            source_kind=body.source_kind, agent=body.agent, scope_id=body.scope_id,
+            occurred_from=body.occurred_from, occurred_to=body.occurred_to, note=body.note,
+        )
+
+    @app.get("/v1/quarantine")
+    def quarantine_queue(include_resolved: bool = False,
+                         principal: Principal = Depends(principal_from_headers)):
+        return svc.quarantine_queue(principal, include_resolved=include_resolved)
+
+    @app.post("/v1/quarantine/{request_id}")
+    def resolve_quarantine(request_id: str, body: QuarantineResolution,
+                           principal: Principal = Depends(principal_from_headers)):
+        return svc.resolve_quarantine(principal, request_id, body.memory_id,
+                                      action=body.action, note=body.note)
+
+    @app.post("/v1/agents/{agent}/freeze")
+    def freeze_agent(agent: str, body: FreezeRequest,
+                     principal: Principal = Depends(principal_from_headers)):
+        return svc.set_agent_freeze(principal, agent, frozen=body.frozen,
+                                    reason=body.reason)
 
     return app
 

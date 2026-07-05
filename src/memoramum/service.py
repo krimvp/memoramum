@@ -23,6 +23,14 @@ promotion with confirmations and the doc 05 §3 gates, the PII pipeline
 in the classify step (doc 06 §4), read-side sensitivity ceilings / trust
 floors / category deny-lists (doc 05 §4.2), and policy administration
 with simulation mode (doc 05 §5).
+
+P4 surface (doc 07 §6): the remaining origin kinds through the same
+write pipeline (`agent_observed` from the extraction workers,
+`consolidated` with weakest-input entry tier and minimum-input trust,
+doc 03 §2 / doc 06 §3), provenance-derived trust at write, memory_forget
+(doc 03 §6 path 1), lineage quarantine with review (doc 06 §3), the
+break-glass write-freeze (doc 05 §5), and the GDPR erasure pipeline with
+signed attestations (doc 06 §2, erasure.py).
 """
 
 from __future__ import annotations
@@ -32,7 +40,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import events, lifecycle, pii, policy, retrieval, scopes
+from . import erasure, events, lifecycle, pii, policy, retrieval, scopes
 from .config import Settings
 from .embedding import make_embedder
 from .principals import Flow, Principal
@@ -44,9 +52,9 @@ ORIGIN_KINDS = ("explicit_user_ask", "llm_inferred", "agent_observed", "consolid
 # consolidator even when they fire inline on the write path.
 CONSOLIDATOR = Principal("system:consolidator")
 
-# Entry status by origin (doc 03 §2). The built-in org policy lets the
-# first two rows through; the table is complete so P4 doesn't have to
-# touch this module.
+# Entry status by origin (doc 03 §2). `consolidated` additionally
+# inherits the weakest input tier — staged if any source memory was
+# staged (_enact_write).
 ENTRY_STATUS = {
     "explicit_user_ask": "active",
     "llm_inferred": "staged",
@@ -55,11 +63,12 @@ ENTRY_STATUS = {
     "imported": "staged",
 }
 
-# Provenance-derived trust (doc 06 §3). P1 keeps the simplest defensible
-# map: explicit user directives are high-trust; everything else keeps the
-# DDL default until the real derivation lands.
-ORIGIN_TRUST = {"explicit_user_ask": 0.9}
 ORIGIN_CONFIDENCE = {"explicit_user_ask": 0.9}
+
+# Episode source kinds that count as untrusted tool output for trust
+# derivation (doc 06 §3: "content that arrived via untrusted tool output
+# gets a low base").
+UNTRUSTED_SOURCE_KINDS = ("web_fetch", "tool_output", "forwarded")
 
 
 class AccessDenied(PermissionError):
@@ -135,6 +144,7 @@ class MemoryService:
         origin_kind: str, subjects: list[str] | None = None,
         categories: list[str] | None = None, justification: str = "",
         source_episode_ids: list[str] | None = None,
+        source_memory_ids: list[str] | None = None,
         valid_at: datetime | None = None, sensitivity: str = "internal",
     ) -> dict:
         """The write pipeline (doc 05 §2): classify → evaluate layers →
@@ -169,6 +179,15 @@ class MemoryService:
                 subjects=tuple(subjects), participants=tuple(flow.participants),
                 surface=flow.surface, scope_class=source_scope["trust_class"],
             ))
+
+            # Break-glass (doc 05 §5): a frozen agent writes nothing,
+            # whatever the layers say. Reads are unaffected.
+            if verdict.decision != "deny" and self._frozen(cur, principal.actor):
+                verdict = policy.Verdict(
+                    "deny", "org/break-glass",
+                    f"{principal.actor} is write-frozen (break-glass, doc 05 §5)",
+                    verdict.layer_verdicts,
+                )
 
             # Routing (doc 05 §1): policy, not the agent, decides where the
             # write lands; the requested scope is only ever narrowed.
@@ -221,6 +240,7 @@ class MemoryService:
                         "subjects": subjects, "categories": categories,
                         "justification": justification,
                         "source_episode_ids": list(source_episode_ids or []),
+                        "source_memory_ids": list(source_memory_ids or []),
                         "valid_at": valid_at.isoformat() if valid_at else None,
                         "sensitivity": sensitivity,
                         "surface": flow.surface, "container": flow.container,
@@ -246,6 +266,7 @@ class MemoryService:
                 categories=categories, sensitivity=sensitivity,
                 justification=justification,
                 source_episode_ids=list(source_episode_ids or []),
+                source_memory_ids=list(source_memory_ids or []),
                 valid_at=valid_at, target_scope=target_scope,
             )
 
@@ -254,7 +275,7 @@ class MemoryService:
         layers: list, content: str, pii_actions: list, kind: str, origin_kind: str,
         subjects: list[str], categories: list[str], sensitivity: str, justification: str,
         source_episode_ids: list[str], valid_at: datetime | None, target_scope: str,
-        confirmed_by: str | None = None,
+        source_memory_ids: list[str] | None = None, confirmed_by: str | None = None,
     ) -> dict:
         """The enactment half of the write pipeline — also run when a human
         approves a pending `ask` (then `confirmed_by` carries the human and
@@ -276,8 +297,19 @@ class MemoryService:
                 raise NotFound(f"episode {eid!r} not found")
             if not scopes.readable(cur, principal, ep["scope_id"]):
                 raise AccessDenied(f"source episode {eid} is not visible to {principal.actor}")
+        source_memories = []
+        for smid in source_memory_ids or []:
+            src = cur.execute("SELECT * FROM memories WHERE id=%s", (smid,)).fetchone()
+            if src is None:
+                raise NotFound(f"source memory {smid!r} not found")
+            if not scopes.readable(cur, principal, src["scope_id"]):
+                raise AccessDenied(f"source memory {smid} is not visible to {principal.actor}")
+            source_memories.append(src)
 
         status = ENTRY_STATUS[origin_kind] if verdict.decision == "allow" else "staged"
+        if origin_kind == "consolidated" and any(m["status"] == "staged" for m in source_memories):
+            # Consolidator output inherits the weakest input tier (doc 03 §2).
+            status = "staged"
         chain = scopes.resolve_chain(cur, principal, flow)
         if target_scope not in chain:
             # Routed writes (subject scopes) join the dedup/contradiction
@@ -299,7 +331,11 @@ class MemoryService:
         # finds no contradictions, leaving the 'wrong' signal and review
         # queue as the paths in.
         embedding = self.embedder.embed(content)
-        contradicted = self._find_contradiction(cur, chain, content, embedding)
+        # A consolidated successor does not contradict what it derives from.
+        contradicted = self._find_contradiction(
+            cur, chain, content, embedding,
+            exclude_ids={str(m["id"]) for m in source_memories},
+        )
 
         # Retention (doc 05 §1): the winning strategy's TTL, shortened by
         # any per-category retention override; sensitivity is raised to
@@ -315,13 +351,14 @@ class MemoryService:
                                           > policy.sensitivity_rank(sensitivity)):
             sensitivity = verdict.sensitivity_floor
 
+        trust = self._derive_trust(cur, origin_kind, episode_ids, source_memories)
         mem = cur.execute(
             "INSERT INTO memories (kind, content, content_embedding, scope_id, subject_ids,"
             " categories, sensitivity, status, confidence, trust_score, valid_at, expires_at)"
             " VALUES (%s,%s,%s::vector,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             (kind, content, str(embedding) if embedding else None, target_scope, subjects,
              categories, sensitivity, status,
-             ORIGIN_CONFIDENCE.get(origin_kind, 0.7), ORIGIN_TRUST.get(origin_kind, 0.5),
+             ORIGIN_CONFIDENCE.get(origin_kind, 0.7), trust,
              valid_at, expires_at),
         ).fetchone()
         memory_id = str(mem["id"])
@@ -343,15 +380,25 @@ class MemoryService:
                 " VALUES (%s,'episode',%s)",
                 (memory_id, eid),
             )
+        for src in source_memories:
+            cur.execute(
+                "INSERT INTO memory_derivations (memory_id, source_type, source_id)"
+                " VALUES (%s,'memory',%s) ON CONFLICT DO NOTHING",
+                (memory_id, src["id"]),
+            )
+            cur.execute(  # consolidated output keeps its inputs' episode provenance
+                "INSERT INTO memory_derivations (memory_id, source_type, source_id)"
+                " SELECT %s, source_type, source_id FROM memory_derivations"
+                " WHERE memory_id=%s AND source_type='episode' ON CONFLICT DO NOTHING",
+                (memory_id, src["id"]),
+            )
 
         propose_details = {"origin_kind": origin_kind, "entered_status": status,
                            "rule_id": verdict.rule_id}
         response = {"decision": verdict.decision, "memory_id": memory_id, "status": status,
                     "ask_prompt": None, "reason": verdict.reason, "rule_id": verdict.rule_id}
 
-        hold = contradicted is not None and lifecycle.must_hold(
-            status, ORIGIN_TRUST.get(origin_kind, 0.5), contradicted
-        )
+        hold = contradicted is not None and lifecycle.must_hold(status, trust, contradicted)
         if contradicted is not None:
             old_id = str(contradicted["id"])
             key = "contradicts" if hold else "supersedes"
@@ -494,6 +541,9 @@ class MemoryService:
             if not scopes.writable(cur, principal, target_scope):
                 decision, rule_id = "deny", "access/enrollment"
                 reason = f"{principal.actor} is not enrolled as a writer in {target_scope}"
+            if decision != "deny" and self._frozen(cur, principal.actor):
+                decision, rule_id = "deny", "org/break-glass"
+                reason = f"{principal.actor} is write-frozen (break-glass, doc 05 §5)"
 
             decision_event = self._event(
                 cur, principal, "POLICY_DECISION", memory_id=memory_id, scope_id=target_scope,
@@ -604,12 +654,30 @@ class MemoryService:
                     sensitivity=payload.get("sensitivity", "internal"),
                     justification=payload.get("justification", ""),
                     source_episode_ids=payload.get("source_episode_ids") or [],
+                    source_memory_ids=payload.get("source_memory_ids") or [],
                     valid_at=datetime.fromisoformat(payload["valid_at"])
                     if payload.get("valid_at") else None,
                     target_scope=p["target_scope_id"], confirmed_by=human,
                 )
                 return {"pending_id": str(pending_id), "approved": True, "action": "remember",
                         "memory_id": out["memory_id"], "status": out["status"]}
+
+            if p["action"] == "forget":
+                mem = cur.execute(
+                    "SELECT * FROM memories WHERE id=%s", (payload["memory_id"],)
+                ).fetchone()
+                if mem is None or mem["scope_id"] != p["source_scope_id"]:
+                    raise ValueError("the memory moved or vanished since the ask was issued")
+                self._event(
+                    cur, Principal(human), "CONFIRM", memory_id=payload["memory_id"],
+                    scope_id=mem["scope_id"],
+                    details={"via": "forget", "pending_id": str(pending_id), "note": note,
+                             "relayed_by": principal.actor if principal.kind == "agent" else None},
+                )
+                out = self._enact_forget(cur, requester, mem, mode=payload["mode"],
+                                         reason=payload.get("reason", ""), via="ask")
+                return {"pending_id": str(pending_id), "approved": True, "action": "forget",
+                        **out}
 
             mem = cur.execute(
                 "SELECT * FROM memories WHERE id=%s", (payload["memory_id"],)
@@ -840,6 +908,296 @@ class MemoryService:
             return {"queue_id": str(queue_id), "resolution": resolution,
                     "contradicted_id": str(q["contradicted_id"]),
                     "challenger_id": _plain(q["challenger_id"])}
+
+    # ---------- forgetting & incident response (doc 03 §6, doc 06 §2–3) ----------
+
+    def forget(
+        self, principal: Principal, flow: Flow, *, memory_id: str, reason: str = "",
+        mode: str = "archive",
+    ) -> dict:
+        """memory_forget (doc 04 §1) — hard-forget path 1 (doc 03 §6).
+        Policy-gated: an agent alone may only forget memories in its own
+        `agent:*` scope, or ones it authored that are still staged;
+        anything else routes to `ask`. A user forget (directly, or relayed
+        with on_behalf_of) archives by default, tombstones on request —
+        and subject-scope memories always tombstone on explicit user
+        request."""
+        if mode not in ("archive", "tombstone"):
+            raise ValueError(f"unknown mode {mode!r} (expected 'archive' or 'tombstone')")
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            mem = self._get_readable_memory(cur, principal, memory_id)
+            if mem["status"] == "tombstoned":
+                raise ValueError("the memory is already tombstoned")
+            scope = scopes.get_scope(cur, mem["scope_id"])
+            prov = cur.execute(
+                "SELECT responsible_agent FROM memory_provenance WHERE memory_id=%s",
+                (memory_id,),
+            ).fetchone()
+            user = principal.effective_user
+
+            decision, rule_id, why = "ask", "forget/ask-default", (
+                "forgetting beyond the caller's own authority asks a scope member (doc 04 §1)"
+            )
+            if principal.kind == "agent" and self._frozen(cur, principal.actor):
+                decision, rule_id = "deny", "org/break-glass"
+                why = f"{principal.actor} is write-frozen (break-glass, doc 05 §5)"
+            elif user is not None:
+                subject_owner = (scope["family"] == "subject"
+                                 and scopes._has_relation(cur, [mem["scope_id"]], "owner", user))
+                allowed = (subject_owner or user in mem["subject_ids"]
+                           or scopes.user_can_see(cur, user, mem["scope_id"])
+                           or scopes.is_auditor(cur, principal, self.settings.org_scope_id))
+                if not allowed:
+                    raise AccessDenied(f"{user} may not forget memory {memory_id}")
+                if subject_owner:
+                    # doc 03 §6: subject-scope memories always tombstone on
+                    # explicit user request.
+                    mode = "tombstone"
+                if mem["status"] == "invariant" and not scopes.is_auditor(
+                        cur, principal, self.settings.org_scope_id):
+                    rule_id = "forget/invariant"
+                    why = "invariants change only by explicit privileged action (doc 03 §1)"
+                else:
+                    decision, rule_id = "allow", "forget/user"
+                    why = "user forget (doc 03 §6 path 1)"
+            else:  # an agent acting alone
+                own_scope = mem["scope_id"] == principal.actor
+                authored_staged = (prov is not None
+                                   and prov["responsible_agent"] == principal.actor
+                                   and mem["status"] == "staged")
+                if own_scope or authored_staged:
+                    decision, rule_id = "allow", "forget/own-authority"
+                    why = ("the agent's own notebook" if own_scope
+                           else "authored by the agent and still staged (doc 04 §1)")
+
+            self._event(
+                cur, principal, "POLICY_DECISION", memory_id=memory_id,
+                scope_id=mem["scope_id"],
+                details={"forget": True, "verdict": decision, "rule_id": rule_id,
+                         "mode": mode, "reason": reason},
+            )
+            response = {"decision": decision, "memory_id": memory_id, "status": mem["status"],
+                        "ask_prompt": None, "pending_id": None,
+                        "reason": why, "rule_id": rule_id}
+            if decision == "deny":
+                return response
+            if decision == "ask":
+                prompt = f"Forget {mem['content']!r} from {self._scope_label(cur, mem['scope_id'])}?"
+                pending = cur.execute(
+                    "INSERT INTO pending_actions (action, payload, requested_by, on_behalf_of,"
+                    " source_scope_id, target_scope_id, confirmer, ask_prompt, rule_id)"
+                    " VALUES ('forget',%s,%s,%s,%s,%s,'scope_member',%s,%s) RETURNING id",
+                    (json.dumps({"memory_id": memory_id, "mode": mode, "reason": reason}),
+                     principal.actor, principal.on_behalf_of, mem["scope_id"], mem["scope_id"],
+                     prompt, rule_id),
+                ).fetchone()
+                response.update(ask_prompt=prompt, pending_id=str(pending["id"]))
+                return response
+            enacted = self._enact_forget(cur, principal, mem, mode=mode, reason=reason)
+            response.update(enacted)
+            return response
+
+    def quarantine(
+        self, principal: Principal, *, episode_id: str | None = None,
+        author: str | None = None, source_kind: str | None = None,
+        agent: str | None = None, scope_id: str | None = None,
+        occurred_from: datetime | None = None, occurred_to: datetime | None = None,
+        note: str = "",
+    ) -> dict:
+        """Lineage quarantine (doc 06 §3): a source predicate → reverse
+        derivation walk → mass QUARANTINE. Quarantined memories are
+        excluded from all retrieval pending review (restore or tombstone);
+        the provenance graph is the security control."""
+        predicate = {k: v for k, v in {
+            "episode_id": episode_id, "author": author, "source_kind": source_kind,
+            "agent": agent, "scope_id": scope_id,
+            "occurred_from": occurred_from.isoformat() if occurred_from else None,
+            "occurred_to": occurred_to.isoformat() if occurred_to else None,
+        }.items() if v is not None}
+        if not predicate:
+            raise ValueError("an empty predicate would quarantine everything; name a source")
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            self._require_incident_role(cur, principal)
+
+            seeds: set[str] = set()
+            if episode_id or author or source_kind or scope_id or occurred_from or occurred_to:
+                where, params = ["true"], []
+                for col, val in (("e.id", episode_id), ("e.author", author),
+                                 ("e.source_kind", source_kind), ("e.scope_id", scope_id)):
+                    if val is not None:
+                        where.append(f"{col} = %s")
+                        params.append(val)
+                if occurred_from is not None:
+                    where.append("e.occurred_at >= %s")
+                    params.append(occurred_from)
+                if occurred_to is not None:
+                    where.append("e.occurred_at <= %s")
+                    params.append(occurred_to)
+                seeds |= {str(r["memory_id"]) for r in cur.execute(
+                    "SELECT DISTINCT d.memory_id FROM memory_derivations d"
+                    " JOIN episodes e ON e.id = d.source_id"
+                    f" WHERE d.source_type='episode' AND {' AND '.join(where)}",
+                    params,
+                ).fetchall()}
+            if agent is not None:
+                where, params = ["p.responsible_agent = %s"], [agent]
+                if occurred_from is not None:
+                    where.append("m.recorded_at >= %s")
+                    params.append(occurred_from)
+                if occurred_to is not None:
+                    where.append("m.recorded_at <= %s")
+                    params.append(occurred_to)
+                seeds |= {str(r["memory_id"]) for r in cur.execute(
+                    "SELECT p.memory_id FROM memory_provenance p"
+                    " JOIN memories m ON m.id = p.memory_id"
+                    f" WHERE {' AND '.join(where)}",
+                    params,
+                ).fetchall()}
+
+            closure = erasure.derived_closure(cur, seeds)
+            rows = cur.execute(
+                "SELECT * FROM memories WHERE id = ANY(%s::uuid[])"
+                " AND status IN ('staged','active','invariant','deprecated')"
+                " ORDER BY recorded_at",
+                (sorted(closure),),
+            ).fetchall() if closure else []
+
+            req = cur.execute(
+                "INSERT INTO quarantine_requests (predicate, requested_by, note)"
+                " VALUES (%s,%s,%s) RETURNING id",
+                (json.dumps(predicate), principal.actor, note),
+            ).fetchone()
+            request_id = str(req["id"])
+            for row in rows:
+                cur.execute(
+                    "INSERT INTO quarantine_items (request_id, memory_id) VALUES (%s,%s)",
+                    (request_id, row["id"]),
+                )
+                self._event(
+                    cur, principal, "QUARANTINE", memory_id=str(row["id"]),
+                    scope_id=row["scope_id"],
+                    details={"request_id": request_id, "predicate": predicate},
+                )
+            return {"request_id": request_id, "predicate": predicate,
+                    "memory_ids": [str(r["id"]) for r in rows]}
+
+    def quarantine_queue(self, principal: Principal, *, include_resolved: bool = False) -> list[dict]:
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            self._require_incident_role(cur, principal)
+            where = "" if include_resolved else "WHERE i.resolved_at IS NULL"
+            rows = cur.execute(
+                f"""
+                SELECT i.request_id, i.memory_id, i.quarantined_at, i.resolved_at,
+                       i.resolution, i.resolved_by, q.predicate, q.requested_by,
+                       m.content, m.status, m.scope_id
+                FROM quarantine_items i
+                JOIN quarantine_requests q ON q.id = i.request_id
+                JOIN memories m ON m.id = i.memory_id
+                {where} ORDER BY i.quarantined_at, i.memory_id
+                """,
+            ).fetchall()
+            return _plain(rows)
+
+    def resolve_quarantine(
+        self, principal: Principal, request_id: str, memory_id: str, *, action: str,
+        note: str = "",
+    ) -> dict:
+        """Close one quarantined item after review (doc 06 §3): restore it
+        to retrieval, or tombstone it."""
+        if action not in ("restore", "tombstone"):
+            raise ValueError(f"unknown action {action!r} (expected 'restore' or 'tombstone')")
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            self._require_incident_role(cur, principal)
+            item = cur.execute(
+                "SELECT * FROM quarantine_items WHERE request_id=%s AND memory_id=%s",
+                (request_id, memory_id),
+            ).fetchone()
+            if item is None:
+                raise NotFound(f"no quarantine item for memory {memory_id!r} in request {request_id!r}")
+            if item["resolved_at"] is not None:
+                raise ValueError(f"the item is already resolved ({item['resolution']})")
+            mem = cur.execute("SELECT * FROM memories WHERE id=%s", (memory_id,)).fetchone()
+            if action == "restore":
+                self._event(cur, principal, "RESTORE", memory_id=memory_id,
+                            scope_id=mem["scope_id"],
+                            details={"request_id": str(request_id), "note": note})
+            else:
+                self._tombstone(cur, principal, mem, f"quarantine review: {note or 'poisoned'}")
+            cur.execute(
+                "UPDATE quarantine_items SET resolved_at=now(), resolution=%s,"
+                " resolved_by=%s, note=%s WHERE request_id=%s AND memory_id=%s",
+                (action, principal.actor, note, request_id, memory_id),
+            )
+            return {"request_id": str(request_id), "memory_id": memory_id, "action": action}
+
+    def set_agent_freeze(
+        self, principal: Principal, agent: str, *, frozen: bool, reason: str = "",
+    ) -> dict:
+        """Break-glass (doc 05 §5): org admins can freeze an agent's writes
+        entirely — one flag, evented, for incident response. Reads are
+        unaffected."""
+        if not agent.startswith("agent:"):
+            raise ValueError("break-glass freezes agents (agent:*)")
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            if not self._is_org_admin(cur, principal):
+                raise AccessDenied(
+                    "break-glass requires the owner relation on the org scope (doc 05 §5)"
+                )
+            if frozen and not self._frozen(cur, agent):
+                cur.execute(
+                    "INSERT INTO agent_freezes (agent, frozen_by, reason) VALUES (%s,%s,%s)",
+                    (agent, principal.actor, reason),
+                )
+            elif not frozen:
+                cur.execute(
+                    "UPDATE agent_freezes SET released_at=now(), released_by=%s"
+                    " WHERE agent=%s AND released_at IS NULL",
+                    (principal.actor, agent),
+                )
+            self._event(
+                cur, principal, "POLICY_CHANGE", scope_id=self.settings.org_scope_id,
+                details={"break_glass": True, "agent": agent, "frozen": frozen,
+                         "reason": reason},
+            )
+            return {"agent": agent, "frozen": frozen}
+
+    def request_erasure(
+        self, principal: Principal, *, subject: str, legal_basis: str = "gdpr_art_17",
+        note: str = "",
+    ) -> dict:
+        """The GDPR erasure pipeline (doc 06 §2.2), run synchronously in
+        the reference implementation (production runs it as a job inside
+        the doc 07 §4 SLOs). Initiated by the subject themself, or by
+        admin/audit roles fulfilling a DSAR."""
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            if not (principal.effective_user == subject
+                    or self._is_org_admin(cur, principal)
+                    or scopes.is_auditor(cur, principal, self.settings.org_scope_id)):
+                raise AccessDenied(
+                    f"erasure of {subject} may be requested by the subject or admin/audit roles"
+                )
+            return erasure.run(self, cur, principal=principal, subject=subject,
+                               legal_basis=legal_basis, note=note)
+
+    def erasure_request(self, principal: Principal, request_id: str) -> dict:
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT * FROM erasure_requests WHERE id=%s", (request_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"erasure request {request_id!r} not found")
+            if not (principal.effective_user == row["subject"]
+                    or self._is_org_admin(cur, principal)
+                    or scopes.is_auditor(cur, principal, self.settings.org_scope_id)):
+                raise AccessDenied("erasure records are for the subject and admin/audit roles")
+            return _plain(row)
 
     # ---------- policy administration (doc 05 §5) ----------
 
@@ -1359,6 +1717,124 @@ class MemoryService:
         self._event(cur, principal, "TOMBSTONE", memory_id=str(mem["id"]),
                     scope_id=mem["scope_id"], details={"from": mem["status"], "reason": reason})
 
+    def _enact_forget(
+        self, cur, principal: Principal, mem: dict, *, mode: str, reason: str,
+        via: str | None = None,
+    ) -> dict:
+        """FORGET is the intent event; tombstoning additionally leaves the
+        content-free TOMBSTONE marker (doc 06 §2)."""
+        details = {"mode": mode, "reason": reason, "from": mem["status"]}
+        if via:
+            details["via"] = via
+        self._event(cur, principal, "FORGET", memory_id=str(mem["id"]),
+                    scope_id=mem["scope_id"], details=details)
+        if mode == "tombstone":
+            self._tombstone(cur, principal, mem, reason or "user forget")
+            return {"memory_id": str(mem["id"]), "status": "tombstoned"}
+        cur.execute("UPDATE memories SET status='archived' WHERE id=%s", (mem["id"],))
+        return {"memory_id": str(mem["id"]), "status": "archived"}
+
+    def _frozen(self, cur, actor: str) -> bool:
+        return cur.execute(
+            "SELECT 1 FROM agent_freezes WHERE agent=%s AND released_at IS NULL LIMIT 1",
+            (actor,),
+        ).fetchone() is not None
+
+    def _require_incident_role(self, cur, principal: Principal) -> None:
+        """Quarantine is an incident lever (doc 06 §3): org admins and
+        auditors only."""
+        if self._is_org_admin(cur, principal) or scopes.is_auditor(
+                cur, principal, self.settings.org_scope_id):
+            return
+        raise AccessDenied(
+            "quarantine tooling requires org-admin or auditor privileges (doc 06 §3)"
+        )
+
+    def _derive_trust(
+        self, cur, origin_kind: str, episode_ids: list[str], source_memories: list[dict],
+    ) -> float:
+        """Provenance-derived trust at write (doc 06 §3): explicit user
+        directives > scope-member authors > external/unattributed authors
+        > untrusted tool output; consolidated inherits the minimum of its
+        inputs. Values are implementation defaults — the ordering is the
+        design."""
+        if origin_kind == "explicit_user_ask":
+            return 0.9
+        if origin_kind == "consolidated":
+            return min((m["trust_score"] for m in source_memories), default=0.5)
+        if origin_kind == "imported":
+            return 0.4
+        if not episode_ids:
+            return 0.5
+        eps = cur.execute(
+            "SELECT author, source_kind, scope_id FROM episodes WHERE id = ANY(%s::uuid[])",
+            (episode_ids,),
+        ).fetchall()
+        if any(e["source_kind"] in UNTRUSTED_SOURCE_KINDS for e in eps):
+            return 0.25
+        if any(e["author"] is None
+               or not scopes.user_can_see(cur, e["author"], e["scope_id"]) for e in eps):
+            return 0.35
+        return 0.6
+
+    def _consolidated_insert(
+        self, cur, principal: Principal, inputs: list[dict], *, scope_id: str,
+        content: str, kind: str, job: str, justification: str,
+        extra_activity: dict | None = None,
+    ) -> str:
+        """Direct consolidated successor for the mechanical jobs (dedupe
+        merge, erasure regeneration): weakest input tier, minimum input
+        trust (doc 03 §2, doc 06 §3), union of subjects / categories /
+        episode provenance. Reflection candidates do NOT come through
+        here — they go through the write pipeline like any agent's
+        (doc 07 §2)."""
+        subjects = sorted({s for m in inputs for s in m["subject_ids"]})
+        categories = sorted({c for m in inputs for c in m["categories"]})
+        sensitivity = max((m["sensitivity"] for m in inputs), key=policy.sensitivity_rank)
+        status = ("staged" if any(m["status"] == "staged" for m in inputs) else "active")
+        expires = [m["expires_at"] for m in inputs if m["expires_at"] is not None]
+        valid = [m["valid_at"] for m in inputs if m["valid_at"] is not None]
+        embedding = self.embedder.embed(content)
+        row = cur.execute(
+            "INSERT INTO memories (kind, content, content_embedding, scope_id, subject_ids,"
+            " categories, sensitivity, status, confidence, trust_score, strength,"
+            " valid_at, expires_at)"
+            " VALUES (%s,%s,%s::vector,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (kind, content, str(embedding) if embedding else None, scope_id, subjects,
+             categories, sensitivity, status,
+             max(m["confidence"] for m in inputs),
+             min(m["trust_score"] for m in inputs),
+             sum(m["strength"] for m in inputs),
+             min(valid) if valid else None, min(expires) if expires else None),
+        ).fetchone()
+        successor_id = str(row["id"])
+        activity = {"job": job, "rule": f"{job}-v1",
+                    "inputs": [str(m["id"]) for m in inputs], **(extra_activity or {})}
+        cur.execute(
+            "INSERT INTO memory_provenance (memory_id, origin_kind, responsible_agent,"
+            " on_behalf_of, activity, justification)"
+            " VALUES (%s,'consolidated',%s,%s,%s,%s)",
+            (successor_id, principal.actor, principal.on_behalf_of,
+             json.dumps(activity), justification),
+        )
+        for m in inputs:
+            cur.execute(
+                "INSERT INTO memory_derivations (memory_id, source_type, source_id)"
+                " VALUES (%s,'memory',%s) ON CONFLICT DO NOTHING",
+                (successor_id, m["id"]),
+            )
+            cur.execute(
+                "INSERT INTO memory_derivations (memory_id, source_type, source_id)"
+                " SELECT %s, source_type, source_id FROM memory_derivations"
+                " WHERE memory_id=%s AND source_type='episode' ON CONFLICT DO NOTHING",
+                (successor_id, m["id"]),
+            )
+        self._event(
+            cur, principal, "PROPOSE", memory_id=successor_id, scope_id=scope_id,
+            details={"origin_kind": "consolidated", "entered_status": status, "job": job},
+        )
+        return successor_id
+
     # ---------- internals: lifecycle (doc 03) ----------
 
     def _find_duplicate(self, cur, chain: list[str], content: str) -> dict | None:
@@ -1414,12 +1890,15 @@ class MemoryService:
 
     def _find_contradiction(
         self, cur, chain: list[str], content: str, embedding: list[float] | None,
+        exclude_ids: set[str] = frozenset(),
     ) -> dict | None:
         neighbors = retrieval.search(
             cur, scope_chain=chain, query=content, query_embedding=embedding,
             settings=self.settings, include_staged=True, trust_floor=0.0, limit=8,
         )
         for n in neighbors:
+            if str(n["id"]) in exclude_ids:
+                continue
             if self.judge.judge(content, n["content"]) == "contradiction":
                 return n
         return None

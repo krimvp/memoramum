@@ -49,7 +49,15 @@ def _candidate_filters(
     deny_categories: list[str] | None,
 ) -> tuple[str, list]:
     statuses = ["active", "invariant"] + (["staged"] if include_staged else [])
-    where = ["m.scope_id = ANY(%s)", "m.trust_score >= %s"]
+    where = [
+        "m.scope_id = ANY(%s)",
+        "m.trust_score >= %s",
+        # Quarantined lineage is excluded from ALL retrieval pending
+        # review (doc 06 §3) — an exclusion joined at read time, not a
+        # status: the doc 02 status enum stays what it is.
+        "NOT EXISTS (SELECT 1 FROM quarantine_items qi"
+        " WHERE qi.memory_id = m.id AND qi.resolved_at IS NULL)",
+    ]
     params: list = [None, trust_floor]  # scope chain patched in by caller
     if sensitivity_ceiling is not None and sensitivity_ceiling != "restricted":
         # The read-side attribute rules (doc 05 §4.2) filter candidates,
