@@ -20,6 +20,26 @@ class Settings:
     # Embedding provider: 'none' (lexical-only retrieval) or 'hash'
     # (deterministic local embedder — dev/test stand-in for a real model).
     embedder: str = field(default_factory=lambda: os.environ.get("MEMORAMUM_EMBEDDER", "none"))
+    # Contradiction judge (doc 03 §3): 'exact' (duplicates only — write-time
+    # contradiction detection off without a model) or 'overlap'
+    # (deterministic dev/test stand-in). A model judge slots in behind the
+    # same interface (lifecycle.Judge).
+    judge: str = field(default_factory=lambda: os.environ.get("MEMORAMUM_JUDGE", "exact"))
+
+    # Status-promotion rule, doc 03 §4 defaults (per-category tuning
+    # arrives with the P3 policy engine).
+    promote_reobservations: int = 1
+    promote_useful_retrievals: int = 2
+    promote_floor_days: int = 3        # agent_observed from non-member authors
+    promote_tenure_days: int | None = None  # unchallenged tenure, off by default
+
+    # Storage-side sweeps, doc 03 §5 defaults.
+    staged_idle_archive_days: int = 30       # staged, never retrieved, unreinforced
+    contradiction_escalate_days: int = 7     # held contradiction → escalate to review
+    contradiction_archive_days: int = 30     # held contradiction → archive challenger
+    decay_archive_threshold: float = 0.05    # active, R below this → archive candidate
+    decay_archive_grace_days: float = 7.0    # candidates archive on a later run (visibility first)
+    history_retention_days: int = 365        # deprecated older than this → archive
 
     # Retrieval scoring knobs, doc 04 §3 defaults. Policy-tunable per agent
     # in P3; global here until the policy engine grows that surface.

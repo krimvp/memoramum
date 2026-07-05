@@ -2,7 +2,7 @@
 
 Memoramum is the design for a **standalone memory service** that lets heterogeneous AI agents — a Slack assistant, an MR-review agent, tomorrow's surfaces — **learn, remember, and forget**, under an explicit policy, with every memory **auditable** from the moment it was proposed to the moment it was erased.
 
-This repository contains the architecture and design documentation, and a **reference implementation** that follows the design's phased rollout ([doc 07 §6](docs/07-operations.md)) — currently at **P1** (remember & recall, audited). The docs are normative; the code implements them.
+This repository contains the architecture and design documentation, and a **reference implementation** that follows the design's phased rollout ([doc 07 §6](docs/07-operations.md)) — currently at **P2** (lifecycle). The docs are normative; the code implements them.
 
 ## Why this exists
 
@@ -42,14 +42,15 @@ One scenario threads through every document, so each mechanism can be seen end-t
 
 ## The reference implementation
 
-`src/memoramum/` implements the design phase by phase (stack decision: [ADR-0007](docs/adr/0007-python-reference-implementation.md); Python + one Postgres 16/pgvector, FastAPI REST facade, MCP facade). **P1** is implemented: the four core tables exactly as specified in [doc 02](docs/02-data-model.md), episodes, `explicit_user_ask` writes, `memory_remember` / `memory_recall` / `memory_status` over MCP, the context block and platform endpoints of [doc 04](docs/04-agent-interface.md), the scope tree + enrollment with retrieval-time access checks, and the full event log including `READ`s (with the subject-scope hash chain). P2–P4 surface (the staged tier via policy, reinforcement, promotion, erasure) is stubbed honestly — denied or `501`, each pointing at its phase.
+`src/memoramum/` implements the design phase by phase (stack decision: [ADR-0007](docs/adr/0007-python-reference-implementation.md); Python + one Postgres 16/pgvector, FastAPI REST facade, MCP facade). **P1** is implemented: the four core tables exactly as specified in [doc 02](docs/02-data-model.md), episodes, `explicit_user_ask` writes, `memory_remember` / `memory_recall` / `memory_status` over MCP, the context block and platform endpoints of [doc 04](docs/04-agent-interface.md), the scope tree + enrollment with retrieval-time access checks, and the full event log including `READ`s (with the subject-scope hash chain). **P2** is implemented: the staged tier filled by `llm_inferred` hot-path writes, `memory_reinforce` plus write-time re-observation, the staged→active promotion rule of [doc 03 §4](docs/03-lifecycle.md), supersession and held-contradiction handling (staged input never supersedes active memories; contradiction judging is a pluggable seam with deterministic dev judges, like the embedder), the consolidator's P2 jobs — status promotion, contradiction-review timers, the decay/TTL sweeps — and the staged-triage review endpoints. P3–P4 surface (the policy engine, scope promotion, `ask` flows, extraction, erasure) is stubbed honestly — denied or `501`, each pointing at its phase.
 
 ```bash
-make venv     # python -m venv + pip install -e '.[dev]'
-make db       # docker compose up postgres (16 + pgvector)
-make migrate  # apply src/memoramum/migrations/ (the doc 02 DDL, verbatim)
-make test     # integration tests incl. the P1 exit criteria of doc 07 §6
-make api      # REST facade on :8385; memoramum-mcp is the agent facade
+make venv        # python -m venv + pip install -e '.[dev]'
+make db          # docker compose up postgres (16 + pgvector)
+make migrate     # apply src/memoramum/migrations/ (the doc 02 DDL, verbatim)
+make test        # integration tests incl. the P1+P2 exit criteria of doc 07 §6
+make api         # REST facade on :8385; memoramum-mcp is the agent facade
+make consolidate # one consolidator run (doc 07 §2 P2 jobs); nightly in production
 ```
 
 ## Glossary

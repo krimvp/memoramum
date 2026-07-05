@@ -1,11 +1,12 @@
 """Learning policy: layered, default-deny, strictest-wins (doc 05 §1–2).
 
-P1 carries the evaluation skeleton and a built-in org layer that enables
-exactly the P1 write surface: `explicit_user_ask` writes are allowed,
-credentials/secrets are denied at the floor, everything else is denied
-until the staged tier arrives in P2 (doc 07 §6). The full engine —
-surface/agent/user-preference layers loaded from versioned policy
-documents, routing, `ask` flows — lands in P3.
+P2 carries the evaluation skeleton and a built-in org layer that enables
+exactly the P2 write surface: `explicit_user_ask` writes are allowed,
+`llm_inferred` hot-path writes route to the staged tier (ADR-0003),
+credentials/secrets are denied at the floor, and everything else is
+denied until the phase that gives it semantics (doc 07 §6). The full
+engine — surface/agent/user-preference layers loaded from versioned
+policy documents, routing, `ask` flows — lands in P3.
 """
 
 from __future__ import annotations
@@ -52,9 +53,9 @@ class Verdict:
     layer_verdicts: dict            # per-layer rule id → decision, for the event
 
 
-P1_ORG_LAYER = PolicyLayer(
+P2_ORG_LAYER = PolicyLayer(
     name="org",
-    version="p1-builtin-1",
+    version="p2-builtin-1",
     strategies=(
         Strategy(
             name="secrets",
@@ -69,9 +70,15 @@ P1_ORG_LAYER = PolicyLayer(
             reason="the user said 'remember this' — skips staging (doc 03 §2)",
         ),
         Strategy(
-            name="p1-default",
+            name="inferred-stage",
+            decision="stage",
+            origin_kinds=("llm_inferred",),
+            reason="agent judgment mid-conversation: useful immediately, trusted later (doc 03 §2)",
+        ),
+        Strategy(
+            name="p2-default",
             decision="deny",
-            reason="only explicit_user_ask writes are enabled in rollout phase P1 (doc 07 §6)",
+            reason="agent_observed extraction, consolidated and imported writes arrive in P4 (doc 07 §6)",
         ),
     ),
 )

@@ -1,9 +1,9 @@
 """MCP facade (ADR-0005): the primary agent-facing surface.
 
-P1 exposes the three P1 tools — memory_remember, memory_recall,
+P2 exposes four tools — memory_remember, memory_recall, memory_reinforce,
 memory_status (doc 07 §6) — plus the prompt contract of doc 04 §4 as an
-MCP prompt. The remaining tools (reinforce, forget, promote, confirm)
-arrive with the phases that give them semantics.
+MCP prompt. The remaining tools (promote, confirm, forget) arrive with the
+phases that give them semantics (P3 policy flows, P4 forgetting).
 
 One server process serves one session context: the principal pair and the
 flow (surface, container, participants) come from the environment the
@@ -97,6 +97,14 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
             principal, flow, query=query, kinds=kinds, subjects=subjects,
             include_staged=include_staged, limit=limit,
         )
+
+    @mcp.tool()
+    def memory_reinforce(memory_id: str, signal: str = "useful", note: str = "") -> dict:
+        """Feedback on a recalled memory. signal='useful' when you used it
+        and it was right (this is what earns staged memories their active
+        status); signal='wrong' when it misled — that lowers confidence and
+        queues it for contradiction review, no forget powers needed."""
+        return service.reinforce(principal, flow, memory_id=memory_id, signal=signal, note=note)
 
     @mcp.tool()
     def memory_status(

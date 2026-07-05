@@ -182,6 +182,8 @@ The contract is persuasive; the *enforcement* is server-side policy ([doc 05](05
 | `GET /v1/memories/{id}` / `GET /v1/memories/{id}/history` | record + full event history (Mem0-style changelog) |
 | `GET /v1/subjects/{principal}/memories` | "everything about X" (review UI, DSAR) |
 | `GET /v1/scopes/{id}/memories` | scope inventory (channel admin view) |
+| `GET /v1/review/staged` / `POST /v1/memories/{id}/review` | staged-triage queue; confirm/reject by a scope member ([doc 03 §4](03-lifecycle.md)) |
+| `GET /v1/review/contradictions` / `POST /v1/review/contradictions/{id}` | held-contradiction queue; resolve supersede / keep-both / reject ([doc 03 §3](03-lifecycle.md)) |
 | `POST /v1/erasure-requests` | GDPR pipeline ([doc 06 §2](06-audit-privacy-security.md)) |
 | `POST /v1/quarantine` | provenance-based bulk revoke ([doc 06 §3](06-audit-privacy-security.md)) |
 | `GET /v1/audit/events` | filtered event-log queries (admin) |
