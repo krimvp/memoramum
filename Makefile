@@ -1,4 +1,4 @@
-.PHONY: venv db migrate test api
+.PHONY: venv db migrate test api consolidate
 
 venv:
 	python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
@@ -15,3 +15,6 @@ test:
 
 api: migrate
 	.venv/bin/memoramum-api
+
+consolidate: migrate
+	.venv/bin/memoramum-consolidate

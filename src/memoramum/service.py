@@ -7,6 +7,13 @@ a write + its provenance + its events commit atomically (ADR-0004).
 P1 surface (doc 07 §6): explicit_user_ask writes, recall + context block,
 status introspection, episodes, scope tree + enrollment, event log
 including READs, per-memory history and per-subject views.
+
+P2 surface (doc 07 §6): the staged tier via llm_inferred hot-path writes,
+reinforcement (memory_reinforce + write-time re-observation) with the
+staged→active promotion rule, write-time contradiction handling
+(supersede or hold, doc 03 §3), and the staged-triage / held-contradiction
+review surface. The batch side — sweeps, escalation — is the
+consolidator's (consolidator.py).
 """
 
 from __future__ import annotations
@@ -16,7 +23,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import events, policy, retrieval, scopes
+from . import events, lifecycle, policy, retrieval, scopes
 from .config import Settings
 from .embedding import make_embedder
 from .principals import Flow, Principal
@@ -24,8 +31,12 @@ from .principals import Flow, Principal
 KINDS = ("semantic", "episodic", "procedural", "profile")
 ORIGIN_KINDS = ("explicit_user_ask", "llm_inferred", "agent_observed", "consolidated", "imported")
 
-# Entry status by origin (doc 03 §2). P1 policy only lets the first row
-# through; the table is complete so P2 doesn't have to touch this module.
+# Micro-run promotions (doc 07 §2: "event-triggered micro-runs") act as the
+# consolidator even when they fire inline on the write path.
+CONSOLIDATOR = Principal("system:consolidator")
+
+# Entry status by origin (doc 03 §2). P2 policy lets the first two rows
+# through; the table is complete so P4 doesn't have to touch this module.
 ENTRY_STATUS = {
     "explicit_user_ask": "active",
     "llm_inferred": "staged",
@@ -54,7 +65,8 @@ class MemoryService:
         self.pool = pool
         self.settings = settings or Settings()
         self.embedder = make_embedder(self.settings.embedder)
-        self.policy_layers = [policy.P1_ORG_LAYER]
+        self.judge = lifecycle.make_judge(self.settings.judge)
+        self.policy_layers = [policy.P2_ORG_LAYER]
 
     # ---------- platform: scopes & enrollment ----------
 
@@ -181,7 +193,25 @@ class MemoryService:
                     raise AccessDenied(f"source episode {eid} is not visible to {principal.actor}")
 
             status = ENTRY_STATUS[origin_kind] if verdict.decision == "allow" else "staged"
+            chain = scopes.resolve_chain(cur, principal, flow)
+
+            # Re-observation before insertion (doc 03 §4): a duplicate of an
+            # existing memory reinforces it instead of piling on a copy.
+            dup = self._find_duplicate(cur, chain, content)
+            if dup is not None:
+                return self._reobserve(
+                    cur, principal, flow, dup, origin_kind=origin_kind,
+                    episode_ids=episode_ids, verdict=verdict,
+                )
+
+            # Contradiction check against retrieved neighbors in the same
+            # scope chain (doc 03 §3). Judging is LLM-shaped; the judge is a
+            # pluggable seam (lifecycle.Judge) — the default 'exact' judge
+            # finds no contradictions, leaving the 'wrong' signal and review
+            # queue as the paths in.
             embedding = self.embedder.embed(content)
+            contradicted = self._find_contradiction(cur, chain, content, embedding)
+
             mem = cur.execute(
                 "INSERT INTO memories (kind, content, content_embedding, scope_id, subject_ids,"
                 " categories, sensitivity, status, confidence, trust_score, valid_at)"
@@ -207,13 +237,271 @@ class MemoryService:
                     " VALUES (%s,'episode',%s)",
                     (memory_id, eid),
                 )
+
+            propose_details = {"origin_kind": origin_kind, "entered_status": status,
+                               "rule_id": verdict.rule_id}
+            response = {"decision": verdict.decision, "memory_id": memory_id, "status": status,
+                        "ask_prompt": None, "reason": verdict.reason, "rule_id": verdict.rule_id}
+
+            hold = contradicted is not None and lifecycle.must_hold(
+                status, ORIGIN_TRUST.get(origin_kind, 0.5), contradicted
+            )
+            if contradicted is not None:
+                old_id = str(contradicted["id"])
+                key = "contradicts" if hold else "supersedes"
+                propose_details[key] = old_id
+                response[key] = old_id
+
             self._event(
                 cur, principal, "PROPOSE", memory_id=memory_id, scope_id=target_scope,
-                details={"origin_kind": origin_kind, "entered_status": status,
-                         "rule_id": verdict.rule_id},
+                details=propose_details,
             )
-            return {"decision": verdict.decision, "memory_id": memory_id, "status": status,
-                    "ask_prompt": None, "reason": verdict.reason, "rule_id": verdict.rule_id}
+
+            if contradicted is not None and hold:
+                # Held contradiction (doc 03 §3): staged/low-trust input must
+                # not assassinate trusted memories. The challenger stays
+                # staged with a contradicts marker; the pair goes to
+                # consolidation review.
+                cur.execute(
+                    "INSERT INTO contradiction_queue (contradicted_id, challenger_id, queued_by)"
+                    " VALUES (%s,%s,%s)",
+                    (old_id, memory_id, principal.actor),
+                )
+                response["reason"] += (
+                    f"; contradicts {contradicted['status']} memory {old_id} —"
+                    " held for consolidation review (doc 03 §3)"
+                )
+            elif contradicted is not None:
+                self._supersede(cur, principal, contradicted, successor_id=memory_id,
+                                invalid_at=self._evidence_time(cur, episode_ids))
+                response["reason"] += f"; supersedes memory {old_id} (validity window closed)"
+            return response
+
+    def reinforce(
+        self, principal: Principal, flow: Flow, *, memory_id: str, signal: str, note: str = "",
+    ) -> dict:
+        """memory_reinforce (doc 04 §1): explicit usefulness feedback.
+        'useful' increments strength and resets decay; 'wrong' lowers
+        confidence and queues contradiction review — no forget powers
+        needed. Reinforcement never mutates trust (doc 04 §3)."""
+        if signal not in lifecycle.AGENT_SIGNALS:
+            raise ValueError(f"unknown signal {signal!r} (expected one of {lifecycle.AGENT_SIGNALS})")
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            mem = self._get_readable_memory(cur, principal, memory_id)
+            if mem["status"] not in ("staged", "active", "invariant"):
+                raise ValueError(f"cannot reinforce a {mem['status']} memory")
+            details = {"signal": signal, "note": note,
+                       "surface": flow.surface, "session": flow.session_id}
+            if signal == "useful":
+                cur.execute(
+                    "UPDATE memories SET strength = strength + %s, last_accessed_at = now()"
+                    " WHERE id=%s",
+                    (lifecycle.REINFORCEMENT["useful"], memory_id),
+                )
+            else:  # wrong: doubt is a review item, not an agent forget power
+                cur.execute(
+                    "UPDATE memories SET confidence = greatest(0.05, confidence - 0.2)"
+                    " WHERE id=%s",
+                    (memory_id,),
+                )
+                cur.execute(
+                    "INSERT INTO contradiction_queue (contradicted_id, queued_by) VALUES (%s,%s)",
+                    (memory_id, principal.actor),
+                )
+                details["queued"] = "contradiction_review"
+            self._event(cur, principal, "REINFORCE", memory_id=memory_id,
+                        scope_id=mem["scope_id"], details=details)
+            if signal == "useful":
+                self._maybe_promote(cur, memory_id)
+            row = cur.execute(
+                "SELECT status, strength, confidence FROM memories WHERE id=%s", (memory_id,)
+            ).fetchone()
+            return {"memory_id": memory_id, "signal": signal, **_plain(row)}
+
+    # ---------- review surface: staged triage & held contradictions ----------
+
+    def staged_queue(self, principal: Principal, *, scope_id: str | None = None) -> list[dict]:
+        """The staged-triage queue (doc 07 §6 P2): what a review UI lists.
+        Scoped to what the reviewing human could see at the source."""
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            if scope_id is None:
+                if not scopes.is_auditor(cur, principal, self.settings.org_scope_id):
+                    raise AccessDenied("the org-wide staged queue requires the auditor relation")
+                where, params = "true", []
+            else:
+                self._require_reviewer(cur, principal, scope_id)
+                where, params = "m.scope_id = %s", [scope_id]
+            rows = cur.execute(
+                f"""
+                SELECT m.*, q.id AS contradiction_id, q.contradicted_id, q.escalated_at
+                FROM memories m
+                LEFT JOIN contradiction_queue q
+                  ON q.challenger_id = m.id AND q.resolved_at IS NULL
+                WHERE m.status = 'staged' AND {where}
+                ORDER BY q.id IS NOT NULL DESC, m.recorded_at
+                """,
+                params,
+            ).fetchall()
+            out = []
+            for r in rows:
+                item = _plain(_public_memory(r))
+                item["contradicts"] = _plain(r["contradicted_id"])
+                item["provenance"] = self._provenance_hint(cur, str(r["id"]), r["scope_id"])
+                out.append(item)
+            return out
+
+    def review_staged(
+        self, principal: Principal, memory_id: str, *, action: str, note: str = "",
+    ) -> dict:
+        """Explicit confirmation / rejection via the review UI (doc 03 §4).
+        Confirmers are humans who are members of the memory's scope
+        (doc 05 §3) or auditors."""
+        if action not in ("confirm", "reject"):
+            raise ValueError(f"unknown review action {action!r} (expected 'confirm' or 'reject')")
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            mem = cur.execute("SELECT * FROM memories WHERE id=%s", (memory_id,)).fetchone()
+            if mem is None:
+                raise NotFound(f"memory {memory_id!r} not found")
+            self._require_reviewer(cur, principal, mem["scope_id"])
+            if mem["status"] != "staged":
+                raise ValueError(f"only staged memories are triaged; this one is {mem['status']}")
+            if action == "confirm":
+                held = cur.execute(
+                    "SELECT id FROM contradiction_queue WHERE challenger_id=%s"
+                    " AND resolved_at IS NULL",
+                    (memory_id,),
+                ).fetchone()
+                if held:
+                    raise ValueError(
+                        f"memory has a held contradiction (queue item {held['id']});"
+                        " resolve it instead of confirming directly"
+                    )
+                cur.execute(
+                    "UPDATE memories SET strength = strength + %s,"
+                    " confidence = greatest(confidence, 0.9), last_accessed_at = now()"
+                    " WHERE id=%s",
+                    (lifecycle.REINFORCEMENT["confirm"], memory_id),
+                )
+                self._event(cur, principal, "CONFIRM", memory_id=memory_id,
+                            scope_id=mem["scope_id"], details={"via": "review", "note": note})
+                self._promote(cur, principal, mem)
+                new_status = "active"
+            else:
+                cur.execute("UPDATE memories SET status='archived' WHERE id=%s", (memory_id,))
+                cur.execute(
+                    "UPDATE contradiction_queue SET resolved_at=now(), resolution='reject',"
+                    " note=%s WHERE challenger_id=%s AND resolved_at IS NULL",
+                    (note, memory_id),
+                )
+                self._event(cur, principal, "REJECT", memory_id=memory_id,
+                            scope_id=mem["scope_id"], details={"via": "review", "note": note})
+                new_status = "archived"
+            return {"memory_id": memory_id, "action": action, "status": new_status}
+
+    def contradictions(self, principal: Principal, *, include_resolved: bool = False) -> list[dict]:
+        """The held-contradiction queue (doc 03 §3), for review."""
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            where = "" if include_resolved else "WHERE q.resolved_at IS NULL"
+            rows = cur.execute(
+                f"""
+                SELECT q.*, old.content AS contradicted_content, old.status AS contradicted_status,
+                       old.scope_id, ch.content AS challenger_content,
+                       ch.status AS challenger_status
+                FROM contradiction_queue q
+                JOIN memories old ON old.id = q.contradicted_id
+                LEFT JOIN memories ch ON ch.id = q.challenger_id
+                {where} ORDER BY q.queued_at
+                """,
+            ).fetchall()
+            auditor = scopes.is_auditor(cur, principal, self.settings.org_scope_id)
+            visible = [
+                r for r in rows
+                if auditor or (principal.effective_user is not None
+                               and scopes.user_can_see(cur, principal.effective_user, r["scope_id"]))
+            ]
+            return _plain(visible)
+
+    def resolve_contradiction(
+        self, principal: Principal, queue_id: str, *, resolution: str,
+        invalid_at: datetime | None = None, note: str = "",
+    ) -> dict:
+        """Human resolution of a held contradiction (doc 07 §2): supersede,
+        keep both with validity windows, or reject the challenger."""
+        if resolution not in ("supersede", "keep_both", "reject"):
+            raise ValueError(
+                f"unknown resolution {resolution!r} (expected supersede | keep_both | reject)"
+            )
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            q = cur.execute(
+                "SELECT * FROM contradiction_queue WHERE id=%s", (queue_id,)
+            ).fetchone()
+            if q is None:
+                raise NotFound(f"contradiction queue item {queue_id!r} not found")
+            if q["resolved_at"] is not None:
+                raise ValueError(f"queue item {queue_id} is already resolved ({q['resolution']})")
+            old = cur.execute(
+                "SELECT * FROM memories WHERE id=%s", (q["contradicted_id"],)
+            ).fetchone()
+            self._require_reviewer(cur, principal, old["scope_id"])
+            challenger = None
+            if q["challenger_id"] is not None:
+                challenger = cur.execute(
+                    "SELECT * FROM memories WHERE id=%s", (q["challenger_id"],)
+                ).fetchone()
+            if resolution in ("supersede", "keep_both") and challenger is None:
+                raise ValueError(f"queue item {queue_id} has no challenger memory to {resolution}")
+
+            details = {"resolution": resolution, "queue_id": str(queue_id), "note": note}
+            if resolution == "reject":
+                if challenger is not None and challenger["status"] == "staged":
+                    cur.execute("UPDATE memories SET status='archived' WHERE id=%s",
+                                (challenger["id"],))
+                    self._event(cur, principal, "REJECT", memory_id=str(challenger["id"]),
+                                scope_id=challenger["scope_id"], details=details)
+            else:
+                # The human accepted the challenger: explicit confirmation.
+                cur.execute(
+                    "UPDATE memories SET strength = strength + %s,"
+                    " confidence = greatest(confidence, 0.9), last_accessed_at = now()"
+                    " WHERE id=%s",
+                    (lifecycle.REINFORCEMENT["confirm"], challenger["id"]),
+                )
+                self._event(cur, principal, "CONFIRM", memory_id=str(challenger["id"]),
+                            scope_id=challenger["scope_id"], details=details)
+                if challenger["status"] == "staged":
+                    self._promote(cur, principal, challenger)
+                if invalid_at is None:
+                    src = [str(r["source_id"]) for r in cur.execute(
+                        "SELECT source_id FROM memory_derivations"
+                        " WHERE memory_id=%s AND source_type='episode'",
+                        (challenger["id"],),
+                    ).fetchall()]
+                    invalid_at = self._evidence_time(cur, src)
+                if resolution == "supersede":
+                    self._supersede(cur, principal, old, successor_id=str(challenger["id"]),
+                                    invalid_at=invalid_at)
+                else:
+                    # keep_both: both facts stand, with validity windows —
+                    # the old one stays active but describes a fact that
+                    # ended (doc 03 preamble), so it leaves current recall.
+                    cur.execute("UPDATE memories SET invalid_at=%s WHERE id=%s",
+                                (invalid_at, old["id"]))
+                    self._event(cur, principal, "CONFIRM", memory_id=str(old["id"]),
+                                scope_id=old["scope_id"],
+                                details={**details, "invalid_at": invalid_at.isoformat()})
+            cur.execute(
+                "UPDATE contradiction_queue SET resolved_at=now(), resolution=%s, note=%s"
+                " WHERE id=%s",
+                (resolution, note, queue_id),
+            )
+            return {"queue_id": str(queue_id), "resolution": resolution,
+                    "contradicted_id": str(q["contradicted_id"]),
+                    "challenger_id": _plain(q["challenger_id"])}
 
     # ---------- read paths ----------
 
@@ -423,6 +711,141 @@ class MemoryService:
             cur, principal, "READ", scope_id=flow.container,
             details={"memory_ids": memory_ids, "path": path,
                      "surface": flow.surface, "session": flow.session_id, **extra},
+        )
+
+    # ---------- internals: lifecycle (doc 03) ----------
+
+    def _find_duplicate(self, cur, chain: list[str], content: str) -> dict | None:
+        """An existing live memory in the chain with the same normalized
+        content; the narrowest scope wins."""
+        if not chain:
+            return None
+        return cur.execute(
+            "SELECT * FROM memories WHERE scope_id = ANY(%s)"
+            " AND status IN ('staged','active','invariant')"
+            " AND lower(btrim(regexp_replace(content, '\\s+', ' ', 'g'))) = %s"
+            " ORDER BY array_position(%s::text[], scope_id) LIMIT 1",
+            (chain, lifecycle.normalize(content), chain),
+        ).fetchone()
+
+    def _reobserve(
+        self, cur, principal: Principal, flow: Flow, dup: dict, *,
+        origin_kind: str, episode_ids: list[str], verdict,
+    ) -> dict:
+        """The write became a reinforcement (doc 03 §4): an explicit ask
+        that restates a known memory confirms it; anything else counts as a
+        re-observation — but only from an independent episode."""
+        dup_id = str(dup["id"])
+        confirm = origin_kind == "explicit_user_ask"
+        if not confirm and not lifecycle.independent_evidence(cur, dup_id, episode_ids):
+            return {"decision": verdict.decision, "memory_id": dup_id, "status": dup["status"],
+                    "ask_prompt": None, "rule_id": verdict.rule_id, "deduplicated": True,
+                    "reason": "already known; not an independent re-observation (doc 03 §4)"}
+        for eid in episode_ids:  # reinforcement events name their episodes (doc 06 §3)
+            cur.execute(
+                "INSERT INTO memory_derivations (memory_id, source_type, source_id)"
+                " VALUES (%s,'episode',%s) ON CONFLICT DO NOTHING",
+                (dup_id, eid),
+            )
+        signal = "confirm" if confirm else "re_observation"
+        cur.execute(
+            "UPDATE memories SET strength = strength + %s, last_accessed_at = now(),"
+            " confidence = greatest(confidence, %s) WHERE id=%s",
+            (lifecycle.REINFORCEMENT[signal], 0.9 if confirm else 0.0, dup_id),
+        )
+        action = "CONFIRM" if confirm else "REINFORCE"
+        self._event(
+            cur, principal, action, memory_id=dup_id, scope_id=dup["scope_id"],
+            details={"signal": signal, "episodes": episode_ids,
+                     "surface": flow.surface, "session": flow.session_id},
+        )
+        status = dup["status"]
+        if status == "staged" and self._maybe_promote(cur, dup_id):
+            status = "active"
+        return {"decision": verdict.decision, "memory_id": dup_id, "status": status,
+                "ask_prompt": None, "rule_id": verdict.rule_id, "deduplicated": True,
+                "reason": f"duplicate of an existing memory: reinforced ({signal}, doc 03 §4)"}
+
+    def _find_contradiction(
+        self, cur, chain: list[str], content: str, embedding: list[float] | None,
+    ) -> dict | None:
+        neighbors = retrieval.search(
+            cur, scope_chain=chain, query=content, query_embedding=embedding,
+            settings=self.settings, include_staged=True, trust_floor=0.0, limit=8,
+        )
+        for n in neighbors:
+            if self.judge.judge(content, n["content"]) == "contradiction":
+                return n
+        return None
+
+    def _supersede(
+        self, cur, principal: Principal, old: dict, *, successor_id: str, invalid_at: datetime,
+    ) -> None:
+        """Close the validity window and link the successor (doc 03 §3):
+        content is never edited on contradiction (ADR-0001)."""
+        old_id = str(old["id"])
+        cur.execute(
+            "UPDATE memories SET status='deprecated', invalid_at=%s, superseded_by=%s"
+            " WHERE id=%s",
+            (invalid_at, successor_id, old_id),
+        )
+        cur.execute(  # the successor derives from the contradicted memory too
+            "INSERT INTO memory_derivations (memory_id, source_type, source_id)"
+            " VALUES (%s,'memory',%s) ON CONFLICT DO NOTHING",
+            (successor_id, old_id),
+        )
+        self._event(
+            cur, principal, "SUPERSEDE", memory_id=old_id, scope_id=old["scope_id"],
+            details={"superseded_by": successor_id, "invalid_at": invalid_at.isoformat()},
+        )
+
+    def _evidence_time(self, cur, episode_ids: list[str]) -> datetime:
+        """invalid_at default: the new evidence's occurred_at (doc 03 §3)."""
+        if episode_ids:
+            row = cur.execute(
+                "SELECT max(occurred_at) AS t FROM episodes WHERE id = ANY(%s::uuid[])",
+                (episode_ids,),
+            ).fetchone()
+            if row["t"] is not None:
+                return row["t"]
+        return datetime.now(timezone.utc)
+
+    def _maybe_promote(self, cur, memory_id: str) -> bool:
+        """Micro-run of the consolidator's status-promotion job
+        (doc 07 §2: event-triggered micro-runs on reinforcement)."""
+        mem = cur.execute("SELECT * FROM memories WHERE id=%s", (memory_id,)).fetchone()
+        if mem is None or not lifecycle.promotion_due(cur, mem, self.settings):
+            return False
+        self._promote(cur, CONSOLIDATOR, mem)
+        return True
+
+    def _promote(self, cur, principal: Principal, mem: dict) -> None:
+        cur.execute("UPDATE memories SET status='active' WHERE id=%s", (mem["id"],))
+        self._event(
+            cur, principal, "PROMOTE_STATUS", memory_id=str(mem["id"]),
+            scope_id=mem["scope_id"], details={"from": mem["status"], "to": "active"},
+        )
+
+    def _archive(self, cur, principal: Principal, mem: dict, reason: str) -> None:
+        cur.execute("UPDATE memories SET status='archived' WHERE id=%s", (mem["id"],))
+        self._event(
+            cur, principal, "ARCHIVE", memory_id=str(mem["id"]), scope_id=mem["scope_id"],
+            details={"from": mem["status"], "reason": reason},
+        )
+
+    def _require_reviewer(self, cur, principal: Principal, scope_id: str) -> None:
+        """Triage and confirmations are human actions: the reviewing user
+        must be able to see the scope (doc 05 §3 confirmers) or hold the
+        auditor relation. Agents relay `ask` prompts (P3); they do not
+        confirm."""
+        if scopes.is_auditor(cur, principal, self.settings.org_scope_id):
+            return
+        user = principal.effective_user
+        if principal.kind == "user" and user and scopes.user_can_see(cur, user, scope_id):
+            return
+        raise AccessDenied(
+            f"{principal.actor} may not review memories in {scope_id}:"
+            " confirmers are scope members or auditors (doc 05 §3)"
         )
 
     def _get_readable_memory(self, cur, principal: Principal, memory_id: str) -> dict:

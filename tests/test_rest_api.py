@@ -17,7 +17,7 @@ AS_SYSTEM = {"X-Memoramum-Actor": "system:ingest"}
 
 
 def test_healthz(client):
-    assert client.get("/healthz").json() == {"ok": True, "phase": "P1"}
+    assert client.get("/healthz").json() == {"ok": True, "phase": "P2"}
 
 
 def test_episode_and_context_block_roundtrip(client):
@@ -71,6 +71,30 @@ def test_memory_views_and_history(client, svc):
 def test_audit_endpoint_gated(client):
     assert client.get("/v1/audit/events", headers=AS_ADMIN).status_code == 200
     assert client.get("/v1/audit/events", headers=AS_SAGE_FOR_DANA).status_code == 403
+
+
+def test_review_surface_roundtrip(client, svc):
+    from conftest import DEPLOYS_FLOW, SAGE_FOR_DANA
+    mid = svc.remember(
+        SAGE_FOR_DANA, DEPLOYS_FLOW,
+        content="Deploy retro actions are tracked in the channel topic",
+        kind="semantic", origin_kind="llm_inferred",
+    )["memory_id"]
+    as_dana = {"X-Memoramum-Actor": "user:dana"}
+
+    queue = client.get("/v1/review/staged", params={"scope_id": "channel/C0DEP"},
+                       headers=as_dana).json()
+    assert mid in {m["id"] for m in queue}
+
+    out = client.post(f"/v1/memories/{mid}/review", headers=as_dana,
+                      json={"action": "confirm", "note": "dana vouches"})
+    assert out.status_code == 200 and out.json()["status"] == "active"
+
+    assert client.get("/v1/review/contradictions", headers=as_dana).status_code == 200
+    # Agents do not confirm (doc 05 §3).
+    denied = client.post(f"/v1/memories/{mid}/review", headers=AS_SAGE_FOR_DANA,
+                         json={"action": "confirm"})
+    assert denied.status_code == 403
 
 
 def test_later_phase_endpoints_are_honest(client):

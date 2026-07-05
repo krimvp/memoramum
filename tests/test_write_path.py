@@ -1,5 +1,6 @@
-"""The P1 write pipeline: explicit_user_ask lands active with full
-provenance; everything else is denied — as an event, not a shrug."""
+"""The P2 write pipeline: explicit_user_ask lands active with full
+provenance, llm_inferred routes to the staged tier (ADR-0003), and
+everything later-phase is denied — as an event, not a shrug."""
 
 from conftest import DEPLOYS_FLOW, SAGE_FOR_DANA, ADMIN
 
@@ -27,15 +28,27 @@ def test_explicit_ask_lands_active_with_provenance(svc):
     assert "PROPOSE" in actions
 
 
-def test_non_explicit_writes_denied_in_p1(svc):
+def test_inferred_writes_route_to_the_staged_tier(svc):
     verdict = svc.remember(
         SAGE_FOR_DANA, DEPLOYS_FLOW,
         content="Atlas may be adopting feature flags",
         kind="semantic", origin_kind="llm_inferred",
+        justification="single observation in a thread",
+    )
+    assert verdict["decision"] == "stage"
+    assert verdict["status"] == "staged"       # useful immediately, trusted later (ADR-0003)
+    assert verdict["memory_id"] is not None
+
+
+def test_later_phase_origins_denied_in_p2(svc):
+    verdict = svc.remember(
+        SAGE_FOR_DANA, DEPLOYS_FLOW,
+        content="Background extraction has no write path yet",
+        kind="semantic", origin_kind="agent_observed",
     )
     assert verdict["decision"] == "deny"
     assert verdict["memory_id"] is None
-    assert "P1" in verdict["reason"]
+    assert "P4" in verdict["reason"]
     # Denials are queryable: "what has agent X been prevented from learning".
     denials = [
         e for e in svc.audit_events(ADMIN, action="POLICY_DECISION", actor="agent:sage")

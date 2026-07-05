@@ -5,10 +5,6 @@ from conftest import DEPLOYS_FLOW, SAGE_FOR_DANA, ADMIN
 
 import pytest
 
-from memoramum import policy
-from memoramum.config import Settings
-from memoramum.service import MemoryService
-
 
 @pytest.fixture(scope="module")
 def block_world(svc):
@@ -28,16 +24,9 @@ def block_world(svc):
         # Pinning is a privileged action with no P1 tool; set up directly.
         conn.execute("UPDATE memories SET status='invariant' WHERE id=%s", (pinned,))
 
-    # The staged tier exists in the schema and read path from day one; only
-    # the P1 *policy* keeps agents from filling it. A stage-verdict layer
-    # stands in for P2 here.
-    staging = MemoryService(svc.pool, Settings(database_url="unused", embedder="hash"))
-    staging.policy_layers = [policy.PolicyLayer(
-        name="org", version="test-stage",
-        strategies=(policy.Strategy(name="stage-inferred", decision="stage",
-                                    origin_kinds=("llm_inferred",)),),
-    )]
-    staged = staging.remember(
+    # Since P2 the staged tier fills through the ordinary write path:
+    # llm_inferred stages by policy (ADR-0003).
+    staged = svc.remember(
         SAGE_FOR_DANA, DEPLOYS_FLOW,
         content="Atlas may be adopting feature flags for deploys",
         kind="semantic", origin_kind="llm_inferred", categories=["process"],

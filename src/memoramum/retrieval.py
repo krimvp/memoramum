@@ -51,13 +51,20 @@ def _candidate_filters(
         params.append(statuses)
         where.append("m.invalid_at IS NULL")
     else:
-        # Historical belief query (audit-gated upstream). Approximation until
-        # supersession events land in P2: what was recorded by then and not
-        # already invalid then.
+        # Historical belief query (audit-gated upstream): recorded by then,
+        # and no lifecycle-ending event — supersession, deprecation,
+        # archival, rejection — had happened yet. The event log is what
+        # makes "what did we believe on date X" answerable (doc 03 §3).
         where.append("m.status <> 'tombstoned'")
         where.append("m.recorded_at <= %s")
         params.append(as_of)
         where.append("(m.invalid_at IS NULL OR m.invalid_at > %s)")
+        params.append(as_of)
+        where.append(
+            "NOT EXISTS (SELECT 1 FROM memory_events e WHERE e.memory_id = m.id"
+            " AND e.action IN ('SUPERSEDE','DEPRECATE','ARCHIVE','REJECT','TOMBSTONE','FORGET')"
+            " AND e.at <= %s)"
+        )
         params.append(as_of)
     if kinds:
         where.append("m.kind = ANY(%s)")

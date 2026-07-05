@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "memoramum"
 version = "0.1.0"
-description = "Reference implementation of the Memoramum memory service (rollout phase P1)"
+description = "Reference implementation of the Memoramum memory service (rollout phase P2)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -27,6 +27,7 @@ dev = [
 memoramum-api = "memoramum.rest:main"
 memoramum-mcp = "memoramum.mcp_server:main"
 memoramum-migrate = "memoramum.db:main"
+memoramum-consolidate = "memoramum.consolidator:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

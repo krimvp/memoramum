@@ -77,6 +77,17 @@ class RelationRequest(BaseModel):
     remove: bool = False
 
 
+class ReviewRequest(BaseModel):
+    action: str                    # confirm | reject
+    note: str = ""
+
+
+class ResolutionRequest(BaseModel):
+    resolution: str                # supersede | keep_both | reject
+    invalid_at: datetime | None = None
+    note: str = ""
+
+
 def create_app(service: MemoryService | None = None, settings: Settings | None = None) -> FastAPI:
     settings = settings or settings_from_env()
     svc = service or MemoryService(make_pool(settings.database_url), settings)
@@ -96,7 +107,7 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
 
     @app.get("/healthz")
     def healthz():
-        return {"ok": True, "phase": "P1"}
+        return {"ok": True, "phase": "P2"}
 
     @app.post("/v1/context-block")
     def context_block(
@@ -168,6 +179,31 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
                      principal: Principal = Depends(principal_from_headers)):
         svc.set_relation(principal, scope_id, body.relation, body.principal, remove=body.remove)
         return {"ok": True}
+
+    # --- review surface: staged triage & held contradictions (doc 07 §6 P2) ---
+
+    @app.get("/v1/review/staged")
+    def staged_queue(scope_id: str | None = None,
+                     principal: Principal = Depends(principal_from_headers)):
+        return svc.staged_queue(principal, scope_id=scope_id)
+
+    @app.post("/v1/memories/{memory_id}/review")
+    def review_memory(memory_id: str, body: ReviewRequest,
+                      principal: Principal = Depends(principal_from_headers)):
+        return svc.review_staged(principal, memory_id, action=body.action, note=body.note)
+
+    @app.get("/v1/review/contradictions")
+    def contradiction_queue(include_resolved: bool = False,
+                            principal: Principal = Depends(principal_from_headers)):
+        return svc.contradictions(principal, include_resolved=include_resolved)
+
+    @app.post("/v1/review/contradictions/{queue_id}")
+    def resolve_contradiction(queue_id: str, body: ResolutionRequest,
+                              principal: Principal = Depends(principal_from_headers)):
+        return svc.resolve_contradiction(
+            principal, queue_id, resolution=body.resolution,
+            invalid_at=body.invalid_at, note=body.note,
+        )
 
     # --- later-phase surface, kept visible and honest ---
 
