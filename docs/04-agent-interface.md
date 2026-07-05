@@ -169,7 +169,8 @@ Shipped with the MCP server as a system-prompt snippet; per-agent policy can ext
 - honor the verdicts: `deny` is final for this write — do not rephrase to evade; relay `ask` questions verbatim;
 - never claim to have remembered or forgotten something unless the tool confirmed it;
 - prefer citing provenance for memory-derived claims ("per @dana in #deploys in March");
-- treat `[staged]` items as hypotheses: verify before acting on them in consequential ways.
+- treat `[staged]` items as hypotheses: verify before acting on them in consequential ways;
+- if a tool returns `unavailable`, say "I can't check my memory right now" — don't guess, and don't claim memory you couldn't reach ([doc 07 §5](07-operations.md)).
 
 The contract is persuasive; the *enforcement* is server-side policy ([doc 05](05-policy.md)) — the design assumes agents will sometimes ignore instructions, and nothing in the security model depends on them not doing so.
 
@@ -179,6 +180,7 @@ The contract is persuasive; the *enforcement* is server-side policy ([doc 05](05
 |---|---|
 | `POST /v1/context-block` | ambient recall (§2.1) |
 | `POST /v1/episodes` | register source episodes (platform ingestion, not agents) |
+| `POST /v1/membership-sync` | per-surface sync heartbeat from platform ingestion; feeds the retrieval staleness bound ([doc 07 §5](07-operations.md)) |
 | `GET /v1/memories/{id}` / `GET /v1/memories/{id}/history` | record + full event history (Mem0-style changelog) |
 | `GET /v1/subjects/{principal}/memories` | "everything about X" (review UI, DSAR) |
 | `GET /v1/scopes/{id}/memories` | scope inventory (channel admin view) |

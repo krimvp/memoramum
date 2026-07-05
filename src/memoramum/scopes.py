@@ -197,6 +197,36 @@ def resolve_chain(cur, principal: Principal, flow: Flow) -> list[str]:
     return [s for s in chain if readable(cur, principal, s)]
 
 
+def membership_staleness_seconds(cur, surface: str | None) -> float | None:
+    """Seconds since the surface's last membership-sync heartbeat
+    (doc 07 §5), or None when there is nothing to measure: no surface in
+    the flow, or a surface that has never synced — its membership is
+    authored directly in the service and has no sync to go stale."""
+    if not surface:
+        return None
+    row = cur.execute(
+        "SELECT EXTRACT(epoch FROM now() - synced_at) AS age"
+        " FROM membership_sync WHERE surface = %s",
+        (surface,),
+    ).fetchone()
+    return float(row["age"]) if row else None
+
+
+def synced_private(cur, scope_ids: list[str]) -> set[str]:
+    """The subset whose visibility rests on synced surface membership AND
+    whose trust class is private — exactly the scopes that fail closed
+    beyond the doc 07 §5 staleness bound. Service-native families
+    (subject, agent, org) have no surface and are never dropped."""
+    if not scope_ids:
+        return set()
+    rows = cur.execute(
+        "SELECT id FROM scopes WHERE id = ANY(%s)"
+        " AND trust_class = 'private' AND surface IS NOT NULL",
+        (scope_ids,),
+    ).fetchall()
+    return {r["id"] for r in rows}
+
+
 def is_auditor(cur, principal: Principal, org_scope_id: str) -> bool:
     """as-of/history queries are an audit feature, not an agent feature
     (doc 05 §4.2): they require the auditor relation on the org scope."""
