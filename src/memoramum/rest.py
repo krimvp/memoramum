@@ -88,6 +88,20 @@ class ResolutionRequest(BaseModel):
     note: str = ""
 
 
+class PendingResolutionRequest(BaseModel):
+    approved: bool
+    note: str = ""
+
+
+class PolicyRequest(BaseModel):
+    document: dict[str, Any] | str      # a policy document, or its YAML text (doc 05 §5)
+
+
+class SimulationRequest(BaseModel):
+    document: dict[str, Any] | str
+    days: int = 30
+
+
 def create_app(service: MemoryService | None = None, settings: Settings | None = None) -> FastAPI:
     settings = settings or settings_from_env()
     svc = service or MemoryService(make_pool(settings.database_url), settings)
@@ -107,7 +121,7 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
 
     @app.get("/healthz")
     def healthz():
-        return {"ok": True, "phase": "P2"}
+        return {"ok": True, "phase": "P3"}
 
     @app.post("/v1/context-block")
     def context_block(
@@ -196,6 +210,34 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
     def contradiction_queue(include_resolved: bool = False,
                             principal: Principal = Depends(principal_from_headers)):
         return svc.contradictions(principal, include_resolved=include_resolved)
+
+    # --- ask confirmations (doc 04 §1, doc 06 §1.2) ---
+
+    @app.get("/v1/review/pending")
+    def pending_queue(scope_id: str | None = None,
+                      principal: Principal = Depends(principal_from_headers)):
+        return svc.pending_queue(principal, scope_id=scope_id)
+
+    @app.post("/v1/review/pending/{pending_id}")
+    def resolve_pending(pending_id: str, body: PendingResolutionRequest,
+                        principal: Principal = Depends(principal_from_headers)):
+        return svc.confirm_pending(principal, pending_id, approved=body.approved,
+                                   note=body.note)
+
+    # --- policy administration (doc 05 §5) ---
+
+    @app.get("/v1/policies")
+    def list_policies(principal: Principal = Depends(principal_from_headers)):
+        return svc.policies(principal)
+
+    @app.post("/v1/policies")
+    def put_policy(body: PolicyRequest, principal: Principal = Depends(principal_from_headers)):
+        return svc.put_policy(principal, body.document)
+
+    @app.post("/v1/policies/simulate")
+    def simulate_policy(body: SimulationRequest,
+                        principal: Principal = Depends(principal_from_headers)):
+        return svc.simulate_policy(principal, body.document, days=body.days)
 
     @app.post("/v1/review/contradictions/{queue_id}")
     def resolve_contradiction(queue_id: str, body: ResolutionRequest,

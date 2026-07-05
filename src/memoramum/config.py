@@ -25,9 +25,12 @@ class Settings:
     # (deterministic dev/test stand-in). A model judge slots in behind the
     # same interface (lifecycle.Judge).
     judge: str = field(default_factory=lambda: os.environ.get("MEMORAMUM_JUDGE", "exact"))
+    # PII analyzer (doc 06 §4): 'regex' (deterministic pattern stand-in for
+    # a Presidio-class model — same seam) or 'none' (scanning off).
+    pii_analyzer: str = field(default_factory=lambda: os.environ.get("MEMORAMUM_PII", "regex"))
 
-    # Status-promotion rule, doc 03 §4 defaults (per-category tuning
-    # arrives with the P3 policy engine).
+    # Status-promotion rule, doc 03 §4 defaults (global; the doc's
+    # "per-category tunable" remains future policy surface).
     promote_reobservations: int = 1
     promote_useful_retrievals: int = 2
     promote_floor_days: int = 3        # agent_observed from non-member authors
@@ -41,8 +44,10 @@ class Settings:
     decay_archive_grace_days: float = 7.0    # candidates archive on a later run (visibility first)
     history_retention_days: int = 365        # deprecated older than this → archive
 
-    # Retrieval scoring knobs, doc 04 §3 defaults. Policy-tunable per agent
-    # in P3; global here until the policy engine grows that surface.
+    # Retrieval scoring knobs, doc 04 §3 defaults. The policy engine (P3)
+    # tunes the read-side gates per agent (trust floor, sensitivity
+    # ceiling, staged inclusion, category deny-lists — doc 05 §4.2); the
+    # score weights themselves stay global defaults.
     status_weights: dict = field(
         default_factory=lambda: {"invariant": 1.2, "active": 1.0, "staged": 0.6}
     )

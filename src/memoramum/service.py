@@ -14,16 +14,25 @@ staged→active promotion rule, write-time contradiction handling
 (supersede or hold, doc 03 §3), and the staged-triage / held-contradiction
 review surface. The batch side — sweeps, escalation — is the
 consolidator's (consolidator.py).
+
+P3 surface (doc 07 §6): the full learning-policy engine — versioned
+policy documents evaluated org → surface → agent → user-preference with
+strictest-wins composition and policy-decided routing (doc 05 §1–2) —
+`ask` flows backed by a pending-action store and `memory_confirm`, scope
+promotion with confirmations and the doc 05 §3 gates, the PII pipeline
+in the classify step (doc 06 §4), read-side sensitivity ceilings / trust
+floors / category deny-lists (doc 05 §4.2), and policy administration
+with simulation mode (doc 05 §5).
 """
 
 from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import events, lifecycle, policy, retrieval, scopes
+from . import events, lifecycle, pii, policy, retrieval, scopes
 from .config import Settings
 from .embedding import make_embedder
 from .principals import Flow, Principal
@@ -35,8 +44,9 @@ ORIGIN_KINDS = ("explicit_user_ask", "llm_inferred", "agent_observed", "consolid
 # consolidator even when they fire inline on the write path.
 CONSOLIDATOR = Principal("system:consolidator")
 
-# Entry status by origin (doc 03 §2). P2 policy lets the first two rows
-# through; the table is complete so P4 doesn't have to touch this module.
+# Entry status by origin (doc 03 §2). The built-in org policy lets the
+# first two rows through; the table is complete so P4 doesn't have to
+# touch this module.
 ENTRY_STATUS = {
     "explicit_user_ask": "active",
     "llm_inferred": "staged",
@@ -66,7 +76,7 @@ class MemoryService:
         self.settings = settings or Settings()
         self.embedder = make_embedder(self.settings.embedder)
         self.judge = lifecycle.make_judge(self.settings.judge)
-        self.policy_layers = [policy.P2_ORG_LAYER]
+        self.analyzer = pii.make_analyzer(self.settings.pii_analyzer)
 
     # ---------- platform: scopes & enrollment ----------
 
@@ -127,39 +137,71 @@ class MemoryService:
         source_episode_ids: list[str] | None = None,
         valid_at: datetime | None = None, sensitivity: str = "internal",
     ) -> dict:
-        """The write pipeline (doc 05 §2). The response is the policy
-        verdict, not a bare ack (doc 04 §1)."""
+        """The write pipeline (doc 05 §2): classify → evaluate layers →
+        emit POLICY_DECISION → enact. The response is the policy verdict,
+        not a bare ack (doc 04 §1)."""
         if kind not in KINDS:
             raise ValueError(f"unknown kind {kind!r}")
         if origin_kind not in ORIGIN_KINDS:
             raise ValueError(f"unknown origin_kind {origin_kind!r}")
         subjects = subjects or []
-        categories = categories or []
+        categories = list(categories or [])
         if not flow.container:
             raise ValueError("flow.container is required: writes route to the source scope")
 
         with self.pool.connection() as conn:
             cur = conn.cursor()
-            target_scope = flow.container  # route: source (doc 05 §1)
-            if scopes.get_scope(cur, target_scope) is None:
-                raise NotFound(f"scope {target_scope!r} not found")
+            source_scope = scopes.get_scope(cur, flow.container)
+            if source_scope is None:
+                raise NotFound(f"scope {flow.container!r} not found")
 
-            # Enrollment gate first — an agent not enrolled as writer never
-            # gets a policy 'allow'. Denials are events, not shrugs.
+            # Classify (doc 05 §2): the PII scan enriches the categories the
+            # policy matches on — detected credentials trip the org secrets
+            # floor even when the agent supplied no category.
+            entities = self.analyzer.analyze(content)
+            if any(e.kind == "credential" for e in entities) and "credentials" not in categories:
+                categories.append("credentials")
+
+            layers = self._layers(cur, agent=principal.actor, surface=flow.surface,
+                                  subjects=subjects)
+            verdict = policy.evaluate(layers, policy.Candidate(
+                kind=kind, categories=tuple(categories), origin_kind=origin_kind,
+                subjects=tuple(subjects), participants=tuple(flow.participants),
+                surface=flow.surface, scope_class=source_scope["trust_class"],
+            ))
+
+            # Routing (doc 05 §1): policy, not the agent, decides where the
+            # write lands; the requested scope is only ever narrowed.
+            target_scope = flow.container
+            if verdict.decision != "deny" and verdict.route_scope == "subject":
+                target_scope = self._route_subject(cur, subjects) or target_scope
+
+            # Enrollment gate on the routed target — an agent not enrolled
+            # as writer never gets a policy 'allow'. Denials are events.
             if not scopes.writable(cur, principal, target_scope):
                 verdict = policy.Verdict(
                     "deny", "access/enrollment",
-                    f"{principal.actor} is not enrolled as a writer in {target_scope}", {},
+                    f"{principal.actor} is not enrolled as a writer in {target_scope}",
+                    verdict.layer_verdicts,
                 )
-            else:
-                verdict = policy.evaluate(
-                    self.policy_layers, kind=kind, categories=categories, origin_kind=origin_kind
-                )
+
+            # Per-entity PII actions against the routed target (doc 06 §4).
+            pipeline = pii.run(
+                cur, entities, content=content, target_scope_id=target_scope,
+                subjects=subjects, effective_user=principal.effective_user,
+                categories=categories,
+            )
+            if pipeline.blocked and verdict.decision != "deny":
+                verdict = policy.Verdict("deny", "pii/block", pipeline.block_reason,
+                                         verdict.layer_verdicts)
+
             decision_event = self._event(
                 cur, principal, "POLICY_DECISION", scope_id=target_scope,
                 details={"verdict": verdict.decision, "rule_id": verdict.rule_id,
                          "layer_verdicts": verdict.layer_verdicts, "kind": kind,
-                         "origin_kind": origin_kind, "categories": categories},
+                         "origin_kind": origin_kind, "categories": categories,
+                         "subjects": subjects, "participants": list(flow.participants),
+                         "surface": flow.surface, "route": verdict.route_scope},
             )
 
             if verdict.decision == "deny":
@@ -167,115 +209,197 @@ class MemoryService:
                         "ask_prompt": None, "reason": verdict.reason,
                         "rule_id": verdict.rule_id}
             if verdict.decision == "ask":
-                # The confirm leg (memory_confirm + pending store) arrives in
-                # P3; surfacing the prompt keeps the contract honest.
-                return {"decision": "ask", "memory_id": None, "status": None,
-                        "ask_prompt": f"Want me to remember: {content!r}?",
-                        "reason": verdict.reason + " (confirmations arrive in P3; nothing stored)",
-                        "rule_id": verdict.rule_id}
-
-            episode_ids = list(source_episode_ids or [])
-            if not episode_ids and origin_kind == "explicit_user_ask":
-                # The ask is the episode (doc 03 §2): keep the provenance
-                # chain unbroken even when the surface registered nothing.
-                who = principal.effective_user or principal.actor
-                ep = cur.execute(
-                    "INSERT INTO episodes (scope_id, source_kind, external_ref, content, author, occurred_at)"
-                    " VALUES (%s,'user_directive',%s,%s,%s,now()) RETURNING id",
-                    (target_scope, json.dumps({"session": flow.session_id}), content, who),
+                # The two-step of doc 04 §1: park the candidate, hand the
+                # agent the exact question to relay; memory_confirm closes it.
+                pending = cur.execute(
+                    "INSERT INTO pending_actions (action, payload, requested_by, on_behalf_of,"
+                    " source_scope_id, target_scope_id, confirmer, ask_prompt,"
+                    " policy_decision_id, rule_id)"
+                    " VALUES ('remember',%s,%s,%s,%s,%s,'flow_user',%s,%s,%s) RETURNING id",
+                    (json.dumps({
+                        "content": content, "kind": kind, "origin_kind": origin_kind,
+                        "subjects": subjects, "categories": categories,
+                        "justification": justification,
+                        "source_episode_ids": list(source_episode_ids or []),
+                        "valid_at": valid_at.isoformat() if valid_at else None,
+                        "sensitivity": sensitivity,
+                        "surface": flow.surface, "container": flow.container,
+                        "session_id": flow.session_id, "target_scope": target_scope,
+                        "ttl_days": verdict.ttl_days,
+                        "sensitivity_floor": verdict.sensitivity_floor,
+                        "rule_id": verdict.rule_id,
+                     }),
+                     principal.actor, principal.on_behalf_of, flow.container, target_scope,
+                     f"Want me to remember: {content!r}?",
+                     str(decision_event["event_id"]), verdict.rule_id),
                 ).fetchone()
-                episode_ids = [str(ep["id"])]
-            for eid in episode_ids:
-                ep = cur.execute("SELECT scope_id FROM episodes WHERE id=%s", (eid,)).fetchone()
-                if ep is None:
-                    raise NotFound(f"episode {eid!r} not found")
-                if not scopes.readable(cur, principal, ep["scope_id"]):
-                    raise AccessDenied(f"source episode {eid} is not visible to {principal.actor}")
+                return {"decision": "ask", "memory_id": None, "status": None,
+                        "pending_id": str(pending["id"]),
+                        "ask_prompt": f"Want me to remember: {content!r}?",
+                        "reason": verdict.reason, "rule_id": verdict.rule_id}
 
-            status = ENTRY_STATUS[origin_kind] if verdict.decision == "allow" else "staged"
-            chain = scopes.resolve_chain(cur, principal, flow)
+            return self._enact_write(
+                cur, principal, flow, verdict=verdict,
+                decision_event_id=str(decision_event["event_id"]),
+                layers=layers, content=pipeline.content, pii_actions=pipeline.actions,
+                kind=kind, origin_kind=origin_kind, subjects=subjects,
+                categories=categories, sensitivity=sensitivity,
+                justification=justification,
+                source_episode_ids=list(source_episode_ids or []),
+                valid_at=valid_at, target_scope=target_scope,
+            )
 
-            # Re-observation before insertion (doc 03 §4): a duplicate of an
-            # existing memory reinforces it instead of piling on a copy.
-            dup = self._find_duplicate(cur, chain, content)
-            if dup is not None:
-                return self._reobserve(
-                    cur, principal, flow, dup, origin_kind=origin_kind,
-                    episode_ids=episode_ids, verdict=verdict,
-                )
-
-            # Contradiction check against retrieved neighbors in the same
-            # scope chain (doc 03 §3). Judging is LLM-shaped; the judge is a
-            # pluggable seam (lifecycle.Judge) — the default 'exact' judge
-            # finds no contradictions, leaving the 'wrong' signal and review
-            # queue as the paths in.
-            embedding = self.embedder.embed(content)
-            contradicted = self._find_contradiction(cur, chain, content, embedding)
-
-            mem = cur.execute(
-                "INSERT INTO memories (kind, content, content_embedding, scope_id, subject_ids,"
-                " categories, sensitivity, status, confidence, trust_score, valid_at)"
-                " VALUES (%s,%s,%s::vector,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                (kind, content, str(embedding) if embedding else None, target_scope, subjects,
-                 categories, sensitivity, status,
-                 ORIGIN_CONFIDENCE.get(origin_kind, 0.7), ORIGIN_TRUST.get(origin_kind, 0.5),
-                 valid_at),
+    def _enact_write(
+        self, cur, principal: Principal, flow: Flow, *, verdict, decision_event_id: str,
+        layers: list, content: str, pii_actions: list, kind: str, origin_kind: str,
+        subjects: list[str], categories: list[str], sensitivity: str, justification: str,
+        source_episode_ids: list[str], valid_at: datetime | None, target_scope: str,
+        confirmed_by: str | None = None,
+    ) -> dict:
+        """The enactment half of the write pipeline — also run when a human
+        approves a pending `ask` (then `confirmed_by` carries the human and
+        the memory earns `active` through an explicit confirmation)."""
+        episode_ids = list(source_episode_ids)
+        if not episode_ids and origin_kind == "explicit_user_ask":
+            # The ask is the episode (doc 03 §2): keep the provenance
+            # chain unbroken even when the surface registered nothing.
+            who = principal.effective_user or principal.actor
+            ep = cur.execute(
+                "INSERT INTO episodes (scope_id, source_kind, external_ref, content, author, occurred_at)"
+                " VALUES (%s,'user_directive',%s,%s,%s,now()) RETURNING id",
+                (target_scope, json.dumps({"session": flow.session_id}), content, who),
             ).fetchone()
-            memory_id = str(mem["id"])
+            episode_ids = [str(ep["id"])]
+        for eid in episode_ids:
+            ep = cur.execute("SELECT scope_id FROM episodes WHERE id=%s", (eid,)).fetchone()
+            if ep is None:
+                raise NotFound(f"episode {eid!r} not found")
+            if not scopes.readable(cur, principal, ep["scope_id"]):
+                raise AccessDenied(f"source episode {eid} is not visible to {principal.actor}")
+
+        status = ENTRY_STATUS[origin_kind] if verdict.decision == "allow" else "staged"
+        chain = scopes.resolve_chain(cur, principal, flow)
+        if target_scope not in chain:
+            # Routed writes (subject scopes) join the dedup/contradiction
+            # checks even when the flow chain would not have looked there.
+            chain = [target_scope] + chain
+
+        # Re-observation before insertion (doc 03 §4): a duplicate of an
+        # existing memory reinforces it instead of piling on a copy.
+        dup = self._find_duplicate(cur, chain, content)
+        if dup is not None:
+            return self._reobserve(
+                cur, principal, flow, dup, origin_kind=origin_kind,
+                episode_ids=episode_ids, verdict=verdict,
+            )
+
+        # Contradiction check against retrieved neighbors in the same
+        # scope chain (doc 03 §3). Judging is LLM-shaped; the judge is a
+        # pluggable seam (lifecycle.Judge) — the default 'exact' judge
+        # finds no contradictions, leaving the 'wrong' signal and review
+        # queue as the paths in.
+        embedding = self.embedder.embed(content)
+        contradicted = self._find_contradiction(cur, chain, content, embedding)
+
+        # Retention (doc 05 §1): the winning strategy's TTL, shortened by
+        # any per-category retention override; sensitivity is raised to
+        # the strongest matched floor.
+        ttl_days = verdict.ttl_days
+        override = policy.retention_override(layers, categories)
+        if override and override["ttl_days"] is not None:
+            ttl_days = (override["ttl_days"] if ttl_days is None
+                        else min(ttl_days, override["ttl_days"]))
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=ttl_days)
+                      if ttl_days is not None else None)
+        if verdict.sensitivity_floor and (policy.sensitivity_rank(verdict.sensitivity_floor)
+                                          > policy.sensitivity_rank(sensitivity)):
+            sensitivity = verdict.sensitivity_floor
+
+        mem = cur.execute(
+            "INSERT INTO memories (kind, content, content_embedding, scope_id, subject_ids,"
+            " categories, sensitivity, status, confidence, trust_score, valid_at, expires_at)"
+            " VALUES (%s,%s,%s::vector,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (kind, content, str(embedding) if embedding else None, target_scope, subjects,
+             categories, sensitivity, status,
+             ORIGIN_CONFIDENCE.get(origin_kind, 0.7), ORIGIN_TRUST.get(origin_kind, 0.5),
+             valid_at, expires_at),
+        ).fetchone()
+        memory_id = str(mem["id"])
+        activity = {"session": flow.session_id, "surface": flow.surface,
+                    "policy_decision_id": decision_event_id,
+                    "classifier": self.analyzer.version}
+        if pii_actions:
+            activity["pii_actions"] = pii_actions
+        cur.execute(
+            "INSERT INTO memory_provenance (memory_id, origin_kind, responsible_agent,"
+            " on_behalf_of, activity, justification)"
+            " VALUES (%s,%s,%s,%s,%s,%s)",
+            (memory_id, origin_kind, principal.actor, principal.on_behalf_of,
+             json.dumps(activity), justification),
+        )
+        for eid in episode_ids:
             cur.execute(
-                "INSERT INTO memory_provenance (memory_id, origin_kind, responsible_agent,"
-                " on_behalf_of, activity, justification)"
-                " VALUES (%s,%s,%s,%s,%s,%s)",
-                (memory_id, origin_kind, principal.actor, principal.on_behalf_of,
-                 json.dumps({"session": flow.session_id, "surface": flow.surface,
-                             "policy_decision_id": str(decision_event["event_id"])}),
-                 justification),
-            )
-            for eid in episode_ids:
-                cur.execute(
-                    "INSERT INTO memory_derivations (memory_id, source_type, source_id)"
-                    " VALUES (%s,'episode',%s)",
-                    (memory_id, eid),
-                )
-
-            propose_details = {"origin_kind": origin_kind, "entered_status": status,
-                               "rule_id": verdict.rule_id}
-            response = {"decision": verdict.decision, "memory_id": memory_id, "status": status,
-                        "ask_prompt": None, "reason": verdict.reason, "rule_id": verdict.rule_id}
-
-            hold = contradicted is not None and lifecycle.must_hold(
-                status, ORIGIN_TRUST.get(origin_kind, 0.5), contradicted
-            )
-            if contradicted is not None:
-                old_id = str(contradicted["id"])
-                key = "contradicts" if hold else "supersedes"
-                propose_details[key] = old_id
-                response[key] = old_id
-
-            self._event(
-                cur, principal, "PROPOSE", memory_id=memory_id, scope_id=target_scope,
-                details=propose_details,
+                "INSERT INTO memory_derivations (memory_id, source_type, source_id)"
+                " VALUES (%s,'episode',%s)",
+                (memory_id, eid),
             )
 
-            if contradicted is not None and hold:
-                # Held contradiction (doc 03 §3): staged/low-trust input must
-                # not assassinate trusted memories. The challenger stays
-                # staged with a contradicts marker; the pair goes to
-                # consolidation review.
-                cur.execute(
-                    "INSERT INTO contradiction_queue (contradicted_id, challenger_id, queued_by)"
-                    " VALUES (%s,%s,%s)",
-                    (old_id, memory_id, principal.actor),
-                )
-                response["reason"] += (
-                    f"; contradicts {contradicted['status']} memory {old_id} —"
-                    " held for consolidation review (doc 03 §3)"
-                )
-            elif contradicted is not None:
-                self._supersede(cur, principal, contradicted, successor_id=memory_id,
-                                invalid_at=self._evidence_time(cur, episode_ids))
-                response["reason"] += f"; supersedes memory {old_id} (validity window closed)"
-            return response
+        propose_details = {"origin_kind": origin_kind, "entered_status": status,
+                           "rule_id": verdict.rule_id}
+        response = {"decision": verdict.decision, "memory_id": memory_id, "status": status,
+                    "ask_prompt": None, "reason": verdict.reason, "rule_id": verdict.rule_id}
+
+        hold = contradicted is not None and lifecycle.must_hold(
+            status, ORIGIN_TRUST.get(origin_kind, 0.5), contradicted
+        )
+        if contradicted is not None:
+            old_id = str(contradicted["id"])
+            key = "contradicts" if hold else "supersedes"
+            propose_details[key] = old_id
+            response[key] = old_id
+
+        self._event(
+            cur, principal, "PROPOSE", memory_id=memory_id, scope_id=target_scope,
+            details=propose_details,
+        )
+
+        if contradicted is not None and hold:
+            # Held contradiction (doc 03 §3): staged/low-trust input must
+            # not assassinate trusted memories. The challenger stays
+            # staged with a contradicts marker; the pair goes to
+            # consolidation review.
+            cur.execute(
+                "INSERT INTO contradiction_queue (contradicted_id, challenger_id, queued_by)"
+                " VALUES (%s,%s,%s)",
+                (old_id, memory_id, principal.actor),
+            )
+            response["reason"] += (
+                f"; contradicts {contradicted['status']} memory {old_id} —"
+                " held for consolidation review (doc 03 §3)"
+            )
+        elif contradicted is not None:
+            self._supersede(cur, principal, contradicted, successor_id=memory_id,
+                            invalid_at=self._evidence_time(cur, episode_ids))
+            response["reason"] += f"; supersedes memory {old_id} (validity window closed)"
+
+        if confirmed_by is not None:
+            # An approved `ask` is an explicit confirmation (doc 03 §4):
+            # CONFIRM by the human, and unheld staged entries earn active
+            # on the spot.
+            cur.execute(
+                "UPDATE memories SET strength = strength + %s,"
+                " confidence = greatest(confidence, 0.9), last_accessed_at = now()"
+                " WHERE id=%s",
+                (lifecycle.REINFORCEMENT["confirm"], memory_id),
+            )
+            self._event(cur, Principal(confirmed_by), "CONFIRM", memory_id=memory_id,
+                        scope_id=target_scope,
+                        details={"via": "ask", "relayed_by": principal.actor})
+            if status == "staged" and not hold:
+                row = cur.execute("SELECT * FROM memories WHERE id=%s", (memory_id,)).fetchone()
+                self._promote(cur, Principal(confirmed_by), row)
+                response["status"] = "active"
+        return response
 
     def reinforce(
         self, principal: Principal, flow: Flow, *, memory_id: str, signal: str, note: str = "",
@@ -318,6 +442,220 @@ class MemoryService:
                 "SELECT status, strength, confidence FROM memories WHERE id=%s", (memory_id,)
             ).fetchone()
             return {"memory_id": memory_id, "signal": signal, **_plain(row)}
+
+    # ---------- scope promotion (doc 03 §4, doc 05 §3) ----------
+
+    def promote(
+        self, principal: Principal, flow: Flow, *, memory_id: str, target_scope: str,
+        justification: str = "",
+    ) -> dict:
+        """memory_promote (doc 04 §1): move a memory to a broader/other
+        scope. Evaluated as a write into the destination plus the
+        promotion gates of doc 05 §3 — almost always returns `ask`."""
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            mem = self._get_readable_memory(cur, principal, memory_id)
+            if mem["status"] not in ("staged", "active", "invariant"):
+                raise ValueError(f"cannot promote a {mem['status']} memory")
+            source = scopes.get_scope(cur, mem["scope_id"])
+            target = scopes.get_scope(cur, target_scope)
+            if target is None:
+                raise NotFound(f"scope {target_scope!r} not found")
+            if target_scope == mem["scope_id"]:
+                raise ValueError("the memory already lives in that scope")
+
+            crossing = self._crossing(cur, source, target)
+            prov = cur.execute(
+                "SELECT origin_kind FROM memory_provenance WHERE memory_id=%s", (memory_id,)
+            ).fetchone()
+            layers = self._layers(cur, agent=principal.actor,
+                                  surface=flow.surface or source["surface"],
+                                  subjects=mem["subject_ids"])
+            gate = policy.promotion_gate(layers, crossing=crossing,
+                                         source_trust_class=source["trust_class"])
+            # …plus the write-into-destination evaluation (doc 05 §3). A
+            # 'stage' there means the content is learnable at the target;
+            # promotion never re-stages, so it maps to allow.
+            write_verdict = policy.evaluate(layers, policy.Candidate(
+                kind=mem["kind"], categories=tuple(mem["categories"]),
+                origin_kind=prov["origin_kind"] if prov else "llm_inferred",
+                subjects=tuple(mem["subject_ids"]), participants=tuple(flow.participants),
+                surface=target["surface"], scope_class=target["trust_class"],
+            ))
+            write_decision = {"stage": "allow"}.get(write_verdict.decision,
+                                                    write_verdict.decision)
+            if policy.stricter(gate.decision, write_decision) == gate.decision:
+                decision, rule_id, reason = gate.decision, gate.rule_id, gate.reason
+            else:
+                decision, rule_id, reason = (write_decision, write_verdict.rule_id,
+                                             write_verdict.reason)
+            # The one tool where the agent names a scope: the target must be
+            # on its writable set (doc 04 §1).
+            if not scopes.writable(cur, principal, target_scope):
+                decision, rule_id = "deny", "access/enrollment"
+                reason = f"{principal.actor} is not enrolled as a writer in {target_scope}"
+
+            decision_event = self._event(
+                cur, principal, "POLICY_DECISION", memory_id=memory_id, scope_id=target_scope,
+                details={"promotion": True, "verdict": decision, "rule_id": rule_id,
+                         "from": mem["scope_id"], "to": target_scope, "crossing": crossing,
+                         "gate_rule": gate.rule_id,
+                         "layer_verdicts": write_verdict.layer_verdicts},
+            )
+            response = {"decision": decision, "memory_id": memory_id,
+                        "from": mem["scope_id"], "to": target_scope,
+                        "ask_prompt": None, "pending_id": None,
+                        "reason": reason, "rule_id": rule_id}
+            if decision == "deny":
+                return response
+            if decision == "ask":
+                prompt = (f"Share {mem['content']!r} beyond {self._scope_label(cur, mem['scope_id'])}"
+                          f" into {self._scope_label(cur, target_scope)}?")
+                pending = cur.execute(
+                    "INSERT INTO pending_actions (action, payload, requested_by, on_behalf_of,"
+                    " source_scope_id, target_scope_id, confirmer, ask_prompt,"
+                    " policy_decision_id, rule_id)"
+                    " VALUES ('promote',%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (json.dumps({"memory_id": memory_id, "target_scope": target_scope,
+                                 "justification": justification}),
+                     principal.actor, principal.on_behalf_of, mem["scope_id"], target_scope,
+                     gate.confirmer or "scope_member", prompt,
+                     str(decision_event["event_id"]), rule_id),
+                ).fetchone()
+                response.update(ask_prompt=prompt, pending_id=str(pending["id"]))
+                return response
+            enacted = self._enact_promotion(
+                cur, principal, mem, target_scope,
+                decision_event_id=str(decision_event["event_id"]),
+            )
+            response.update(enacted)
+            return response
+
+    def confirm_pending(
+        self, principal: Principal, pending_id: str, *, approved: bool, note: str = "",
+    ) -> dict:
+        """memory_confirm (doc 04 §1) and the review-UI confirmation leg:
+        a human resolves a pending `ask`. Only humans confirm (doc 01 §4)
+        — an agent calls this with `on_behalf_of` carrying the user whose
+        answer it relays, and the CONFIRM/REJECT event is the human's."""
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            p = cur.execute(
+                "SELECT * FROM pending_actions WHERE id=%s", (pending_id,)
+            ).fetchone()
+            if p is None:
+                raise NotFound(f"pending action {pending_id!r} not found")
+            if p["resolved_at"] is not None:
+                raise ValueError(f"pending action {pending_id} is already resolved")
+            human = principal.effective_user
+            if human is None:
+                raise AccessDenied("only humans confirm ask verdicts (doc 01 §4)")
+            self._require_confirmer(cur, human, p)
+            cur.execute(
+                "UPDATE pending_actions SET resolved_at=now(), approved=%s, resolved_by=%s,"
+                " note=%s WHERE id=%s",
+                (approved, human, note, pending_id),
+            )
+            payload = p["payload"]
+            if not approved:
+                # The user declined → REJECT event, nothing stored (doc 05 §6).
+                self._event(
+                    cur, Principal(human), "REJECT",
+                    memory_id=payload.get("memory_id"), scope_id=p["target_scope_id"],
+                    details={"via": "ask", "pending_id": str(pending_id),
+                             "action": p["action"], "note": note,
+                             "relayed_by": principal.actor if principal.kind == "agent" else None},
+                )
+                return {"pending_id": str(pending_id), "approved": False,
+                        "action": p["action"], "memory_id": None, "status": None}
+
+            requester = Principal(p["requested_by"], p["on_behalf_of"])
+            if p["action"] == "remember":
+                flow = Flow(surface=payload.get("surface"), container=payload.get("container"),
+                            session_id=payload.get("session_id"))
+                if not scopes.writable(cur, requester, p["target_scope_id"]):
+                    raise AccessDenied(
+                        f"{requester.actor} is no longer enrolled as a writer"
+                        f" in {p['target_scope_id']}"
+                    )
+                entities = self.analyzer.analyze(payload["content"])
+                pipeline = pii.run(
+                    cur, entities, content=payload["content"],
+                    target_scope_id=p["target_scope_id"], subjects=payload["subjects"],
+                    effective_user=requester.effective_user, categories=payload["categories"],
+                )
+                if pipeline.blocked:
+                    raise ValueError(f"the candidate no longer passes the PII pipeline:"
+                                     f" {pipeline.block_reason}")
+                layers = self._layers(cur, agent=requester.actor,
+                                      surface=payload.get("surface"),
+                                      subjects=payload["subjects"])
+                verdict = policy.Verdict(
+                    "ask", payload.get("rule_id", "ask"), "confirmed by the user", {},
+                    ttl_days=payload.get("ttl_days"),
+                    sensitivity_floor=payload.get("sensitivity_floor"),
+                )
+                out = self._enact_write(
+                    cur, requester, flow, verdict=verdict,
+                    decision_event_id=str(p["policy_decision_id"]), layers=layers,
+                    content=pipeline.content, pii_actions=pipeline.actions,
+                    kind=payload["kind"], origin_kind=payload["origin_kind"],
+                    subjects=payload["subjects"], categories=payload["categories"],
+                    sensitivity=payload.get("sensitivity", "internal"),
+                    justification=payload.get("justification", ""),
+                    source_episode_ids=payload.get("source_episode_ids") or [],
+                    valid_at=datetime.fromisoformat(payload["valid_at"])
+                    if payload.get("valid_at") else None,
+                    target_scope=p["target_scope_id"], confirmed_by=human,
+                )
+                return {"pending_id": str(pending_id), "approved": True, "action": "remember",
+                        "memory_id": out["memory_id"], "status": out["status"]}
+
+            mem = cur.execute(
+                "SELECT * FROM memories WHERE id=%s", (payload["memory_id"],)
+            ).fetchone()
+            if mem is None or mem["scope_id"] != p["source_scope_id"]:
+                raise ValueError("the memory moved or vanished since the ask was issued")
+            if not scopes.writable(cur, requester, p["target_scope_id"]):
+                raise AccessDenied(
+                    f"{requester.actor} is no longer enrolled as a writer"
+                    f" in {p['target_scope_id']}"
+                )
+            self._event(
+                cur, Principal(human), "CONFIRM", memory_id=payload["memory_id"],
+                scope_id=p["target_scope_id"],
+                details={"via": "promotion", "pending_id": str(pending_id), "note": note,
+                         "relayed_by": principal.actor if principal.kind == "agent" else None},
+            )
+            enacted = self._enact_promotion(
+                cur, requester, mem, p["target_scope_id"],
+                decision_event_id=str(p["policy_decision_id"]),
+            )
+            return {"pending_id": str(pending_id), "approved": True, "action": "promote",
+                    **enacted}
+
+    def pending_queue(self, principal: Principal, *, scope_id: str | None = None) -> list[dict]:
+        """Open `ask` confirmations, for the review UI (doc 06 §1.2) and
+        for users asking 'what is waiting on me'."""
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            if scope_id is not None:
+                self._require_reviewer(cur, principal, scope_id)
+                where, params = "p.resolved_at IS NULL AND p.target_scope_id=%s", [scope_id]
+            elif scopes.is_auditor(cur, principal, self.settings.org_scope_id):
+                where, params = "p.resolved_at IS NULL", []
+            else:
+                user = principal.effective_user
+                if user is None:
+                    raise AccessDenied("pass a scope_id, or ask as a user or auditor")
+                where, params = "p.resolved_at IS NULL AND p.on_behalf_of=%s", [user]
+            rows = cur.execute(
+                f"SELECT p.id, p.action, p.ask_prompt, p.requested_by, p.on_behalf_of,"
+                f" p.source_scope_id, p.target_scope_id, p.confirmer, p.rule_id, p.created_at"
+                f" FROM pending_actions p WHERE {where} ORDER BY p.created_at",
+                params,
+            ).fetchall()
+            return _plain(rows)
 
     # ---------- review surface: staged triage & held contradictions ----------
 
@@ -503,6 +841,115 @@ class MemoryService:
                     "contradicted_id": str(q["contradicted_id"]),
                     "challenger_id": _plain(q["challenger_id"])}
 
+    # ---------- policy administration (doc 05 §5) ----------
+
+    def put_policy(self, principal: Principal, document) -> dict:
+        """Store a new version of a policy document (YAML in, canonical
+        JSON out). Org admins (owner relation on the org scope) manage the
+        org/surface/agent layers; a user manages their own user-preference
+        layer (doc 05 §2). Every change is a POLICY_CHANGE event with a
+        strategy-level diff."""
+        parsed = policy.parse_document(document)
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            own_pref = (parsed["layer"] == "user_pref" and principal.kind == "user"
+                        and principal.actor == parsed["applies_to"])
+            if not own_pref and not self._is_org_admin(cur, principal):
+                raise AccessDenied(
+                    "policy administration requires the owner relation on the org scope"
+                    " (users may set their own user_pref layer)"
+                )
+            prev = cur.execute(
+                "SELECT version, document FROM policies WHERE layer=%s AND applies_to=%s"
+                " ORDER BY version DESC LIMIT 1",
+                (parsed["layer"], parsed["applies_to"]),
+            ).fetchone()
+            version = (prev["version"] + 1) if prev else 1
+            cur.execute(
+                "INSERT INTO policies (name, layer, applies_to, version, document, created_by)"
+                " VALUES (%s,%s,%s,%s,%s,%s)",
+                (parsed["policy"], parsed["layer"], parsed["applies_to"], version,
+                 json.dumps(parsed), principal.actor),
+            )
+            old_names = {s["name"] for s in
+                         (prev["document"]["learning"]["strategies"] if prev else [])}
+            new_names = {s["name"] for s in parsed["learning"]["strategies"]}
+            self._event(
+                cur, principal, "POLICY_CHANGE", scope_id=self.settings.org_scope_id,
+                details={"policy": parsed["policy"], "layer": parsed["layer"],
+                         "applies_to": parsed["applies_to"], "version": version,
+                         "previous_version": prev["version"] if prev else None,
+                         "diff": {"strategies_added": sorted(new_names - old_names),
+                                  "strategies_removed": sorted(old_names - new_names)}},
+            )
+            return {"policy": parsed["policy"], "layer": parsed["layer"],
+                    "applies_to": parsed["applies_to"], "version": version}
+
+    def policies(self, principal: Principal) -> list[dict]:
+        """The active (latest-version) policy documents."""
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            rows = cur.execute(
+                "SELECT DISTINCT ON (layer, applies_to) name, layer, applies_to, version,"
+                " document, created_by, created_at FROM policies"
+                " ORDER BY layer, applies_to, version DESC",
+            ).fetchall()
+            if not (self._is_org_admin(cur, principal)
+                    or scopes.is_auditor(cur, principal, self.settings.org_scope_id)):
+                user = principal.effective_user
+                rows = [r for r in rows
+                        if r["layer"] == "user_pref" and r["applies_to"] == user]
+            return _plain(rows)
+
+    def simulate_policy(self, principal: Principal, document, *, days: int = 30) -> dict:
+        """Simulation mode (doc 05 §5): evaluate a proposed policy against
+        the last N days of POLICY_DECISION events and report what would
+        change, before activation. Write decisions only — promotion gates
+        and enrollment/PII denials are replayed as-is."""
+        parsed = policy.parse_document(document)
+        proposed = policy.layer_from_document(parsed, "proposed")
+        override = (parsed["layer"], parsed["applies_to"], proposed)
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            if not (self._is_org_admin(cur, principal)
+                    or scopes.is_auditor(cur, principal, self.settings.org_scope_id)):
+                raise AccessDenied("policy simulation requires org-admin or auditor privileges")
+            rows = cur.execute(
+                "SELECT event_id, at, actor, details FROM memory_events"
+                " WHERE action='POLICY_DECISION' AND at >= now() - make_interval(days => %s)"
+                " AND details ? 'origin_kind' AND NOT (details ? 'promotion')"
+                " ORDER BY at",
+                (days,),
+            ).fetchall()
+            evaluated, changed = 0, []
+            for r in rows:
+                d = r["details"]
+                rule = d.get("rule_id", "")
+                if rule.startswith(("access/", "pii/")):
+                    continue  # not a learning-policy outcome
+                evaluated += 1
+                layers = self._layers(cur, agent=r["actor"], surface=d.get("surface"),
+                                      subjects=d.get("subjects") or [], override=override)
+                new = policy.evaluate(layers, policy.Candidate(
+                    kind=d["kind"], categories=tuple(d.get("categories") or ()),
+                    origin_kind=d["origin_kind"],
+                    subjects=tuple(d.get("subjects") or ()),
+                    participants=tuple(d.get("participants") or ()),
+                    surface=d.get("surface"),
+                ))
+                if new.decision != d.get("verdict"):
+                    changed.append({"event_id": str(r["event_id"]), "at": r["at"].isoformat(),
+                                    "actor": r["actor"], "old": d.get("verdict"),
+                                    "new": new.decision, "old_rule": rule,
+                                    "new_rule": new.rule_id})
+            summary: dict[str, int] = {}
+            for c in changed:
+                key = f"{c['old']}->{c['new']}"
+                summary[key] = summary.get(key, 0) + 1
+            return {"policy": parsed["policy"], "layer": parsed["layer"],
+                    "applies_to": parsed["applies_to"], "window_days": days,
+                    "evaluated": evaluated, "changed": changed, "summary": summary}
+
     # ---------- read paths ----------
 
     def recall(
@@ -516,10 +963,14 @@ class MemoryService:
             if as_of is not None and not scopes.is_auditor(cur, principal, self.settings.org_scope_id):
                 raise AccessDenied("as-of queries are an audit feature (doc 05 §4.2)")
             chain = scopes.resolve_chain(cur, principal, flow)
+            rp = self._read_policy(cur, principal, flow)
             hits = retrieval.search(
                 cur, scope_chain=chain, query=query,
                 query_embedding=self.embedder.embed(query), settings=self.settings,
-                kinds=kinds, subjects=subjects, include_staged=include_staged,
+                kinds=kinds, subjects=subjects,
+                include_staged=include_staged and rp.include_staged,
+                trust_floor=rp.trust_floor, sensitivity_ceiling=rp.sensitivity_ceiling,
+                deny_categories=list(rp.deny_categories),
                 as_of=as_of, limit=limit,
             )
             self._deliver(cur, principal, flow, [str(h["id"]) for h in hits],
@@ -535,10 +986,13 @@ class MemoryService:
         with self.pool.connection() as conn:
             cur = conn.cursor()
             chain = scopes.resolve_chain(cur, principal, flow)
+            rp = self._read_policy(cur, principal, flow)
             hits = retrieval.search(
                 cur, scope_chain=chain, query=focus,
                 query_embedding=self.embedder.embed(focus) if focus else None,
-                settings=self.settings, include_staged=True, limit=50,
+                settings=self.settings, include_staged=rp.include_staged,
+                trust_floor=rp.trust_floor, sensitivity_ceiling=rp.sensitivity_ceiling,
+                deny_categories=list(rp.deny_categories), limit=50,
             )
             invariants = [h for h in hits if h["status"] == "invariant"]
             facts = [h for h in hits if h["status"] == "active"]
@@ -713,6 +1167,198 @@ class MemoryService:
                      "surface": flow.surface, "session": flow.session_id, **extra},
         )
 
+    # ---------- internals: policy, routing & promotion (docs 05/06) ----------
+
+    def _layers(
+        self, cur, *, agent: str, surface: str | None, subjects: list[str] | tuple = (),
+        override: tuple | None = None,
+    ) -> list[policy.PolicyLayer]:
+        """The layer stack for one evaluation: org → surface → agent →
+        user-preference (one per user subject — users tighten what is
+        learned *about them*, doc 05 §2). Latest stored version wins;
+        the org layer falls back to the built-in baseline. `override`
+        swaps one (layer, applies_to) slot for simulation mode."""
+        specs = [("org", self.settings.org_scope_id)]
+        if surface:
+            specs.append(("surface", f"surface:{surface}"))
+        specs.append(("agent", agent))
+        for s in subjects or ():
+            if s.startswith("user:"):
+                specs.append(("user_pref", s))
+        layers: list[policy.PolicyLayer] = []
+        for layer_name, applies_to in specs:
+            if override and (layer_name, applies_to) == override[:2]:
+                layers.append(override[2])
+                continue
+            row = cur.execute(
+                "SELECT document, version FROM policies WHERE layer=%s AND applies_to=%s"
+                " ORDER BY version DESC LIMIT 1",
+                (layer_name, applies_to),
+            ).fetchone()
+            if row is not None:
+                layers.append(policy.layer_from_document(row["document"], row["version"]))
+            elif layer_name == "org":
+                layers.append(policy.BUILTIN_ORG_LAYER)
+        return layers
+
+    def _read_policy(self, cur, principal: Principal, flow: Flow) -> policy.ReadPolicy:
+        """The merged read-side attribute rules for this agent/surface
+        (doc 05 §1 `read:`, §4.2)."""
+        return policy.read_policy(
+            self._layers(cur, agent=principal.actor, surface=flow.surface)
+        )
+
+    def _route_subject(self, cur, subjects: list[str]) -> str | None:
+        """route: {scope: subject} (doc 05 §1) — the write lands in the
+        subject scope. Only unambiguous: exactly one subject. The scope is
+        provisioned on first routing; enrollment still gates the write."""
+        if len(subjects) != 1:
+            return None
+        sid = scopes.subject_scope_id(subjects[0])
+        if scopes.get_scope(cur, sid) is None:
+            scopes.create_scope(cur, scope_id=sid, family="subject",
+                                parent_scope_id=self.settings.org_scope_id)
+            if subjects[0].startswith("user:"):
+                cur.execute(
+                    "INSERT INTO scope_relations (scope_id, relation, principal)"
+                    " VALUES (%s,'owner',%s) ON CONFLICT DO NOTHING",
+                    (sid, subjects[0]),
+                )
+        return sid
+
+    def _crossing(self, cur, source: dict, target: dict) -> str:
+        """Classify a promotion for the doc 05 §3 gate table."""
+        if target["family"] == "subject":
+            return "subject"
+        if any(s["id"] == source["id"] for s in scopes.ancestors(cur, target["id"])):
+            return "narrowing"  # broader → narrower: the target sits under the source
+        return "shared"
+
+    def _enact_promotion(
+        self, cur, principal: Principal, mem: dict, target_scope: str, *,
+        decision_event_id: str,
+    ) -> dict:
+        """Move the memory. The write pipeline re-runs against the
+        destination (doc 03 §4, doc 06 §4): if the destination demands a
+        content transform (tokenization), the promoted form is a NEW
+        memory derived from the original — content is immutable
+        (ADR-0001) — and the original stays put; otherwise the memory
+        itself moves scope, which is the normal case (doc 03 §7)."""
+        memory_id = str(mem["id"])
+        entities = self.analyzer.analyze(mem["content"])
+        pipeline = pii.run(
+            cur, entities, content=mem["content"], target_scope_id=target_scope,
+            subjects=mem["subject_ids"], effective_user=None,
+            categories=list(mem["categories"]),
+        )
+        if pipeline.blocked:
+            raise ValueError(f"promotion blocked by the PII pipeline: {pipeline.block_reason}")
+        details = {"from": mem["scope_id"], "to": target_scope,
+                   "policy_decision_id": decision_event_id}
+        if pipeline.actions:
+            details["pii_actions"] = pipeline.actions
+        if pipeline.content == mem["content"]:
+            cur.execute("UPDATE memories SET scope_id=%s WHERE id=%s",
+                        (target_scope, memory_id))
+            cur.execute(
+                "UPDATE memory_provenance SET activity = activity || %s WHERE memory_id=%s",
+                (json.dumps({"promotion_policy_decision_id": decision_event_id}), memory_id),
+            )
+            promoted_id = memory_id
+        else:
+            embedding = self.embedder.embed(pipeline.content)
+            row = cur.execute(
+                "INSERT INTO memories (kind, content, content_embedding, scope_id, subject_ids,"
+                " categories, sensitivity, status, confidence, trust_score, strength,"
+                " valid_at, expires_at)"
+                " VALUES (%s,%s,%s::vector,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                (mem["kind"], pipeline.content, str(embedding) if embedding else None,
+                 target_scope, mem["subject_ids"], mem["categories"], mem["sensitivity"],
+                 mem["status"], mem["confidence"], mem["trust_score"], mem["strength"],
+                 mem["valid_at"], mem["expires_at"]),
+            ).fetchone()
+            promoted_id = str(row["id"])
+            prov = cur.execute(
+                "SELECT * FROM memory_provenance WHERE memory_id=%s", (memory_id,)
+            ).fetchone()
+            cur.execute(
+                "INSERT INTO memory_provenance (memory_id, origin_kind, responsible_agent,"
+                " on_behalf_of, activity, justification)"
+                " VALUES (%s,%s,%s,%s,%s,%s)",
+                (promoted_id, prov["origin_kind"] if prov else "llm_inferred",
+                 principal.actor, principal.on_behalf_of,
+                 json.dumps({"promoted_from": memory_id,
+                             "policy_decision_id": decision_event_id,
+                             "classifier": self.analyzer.version,
+                             "pii_actions": pipeline.actions}),
+                 prov["justification"] if prov else ""),
+            )
+            cur.execute(
+                "INSERT INTO memory_derivations (memory_id, source_type, source_id)"
+                " VALUES (%s,'memory',%s)",
+                (promoted_id, memory_id),
+            )
+            cur.execute(  # the promoted form keeps the episode provenance
+                "INSERT INTO memory_derivations (memory_id, source_type, source_id)"
+                " SELECT %s, source_type, source_id FROM memory_derivations"
+                " WHERE memory_id=%s AND source_type='episode' ON CONFLICT DO NOTHING",
+                (promoted_id, memory_id),
+            )
+            details["promoted_as"] = promoted_id
+        self._event(cur, principal, "PROMOTE_SCOPE", memory_id=memory_id,
+                    scope_id=target_scope, details=details)
+        return {"memory_id": promoted_id, "from": mem["scope_id"], "to": target_scope,
+                "transformed": promoted_id != memory_id}
+
+    def _require_confirmer(self, cur, human: str, pending: dict) -> None:
+        """Who may answer an `ask` (doc 05 §3): the user it was relayed to
+        (writes), any member of the source scope (shared-scope
+        promotions), or the subject (subject-scope promotions)."""
+        kind = pending["confirmer"]
+        if kind == "flow_user":
+            expected = pending["on_behalf_of"]
+            if expected is None:
+                kind = "scope_member"  # agent-only flow: a scope member decides
+            elif human == expected:
+                return
+            else:
+                raise AccessDenied(
+                    f"the ask was relayed to {expected}; {human} may not answer it"
+                )
+        if kind == "scope_member":
+            scope = pending["source_scope_id"] or pending["target_scope_id"]
+            if scopes.user_can_see(cur, human, scope):
+                return
+            raise AccessDenied(
+                f"confirmers are members of {scope} (doc 05 §3); {human} is not"
+            )
+        # subject: dana confirms what is recorded about dana in shared view.
+        target = pending["target_scope_id"]
+        owner = cur.execute(
+            "SELECT principal FROM scope_relations WHERE scope_id=%s AND relation='owner'",
+            (target,),
+        ).fetchall()
+        owners = {r["principal"] for r in owner} or {target.removeprefix("subject:").replace("/", ":", 1)}
+        if human not in owners:
+            raise AccessDenied(f"only the subject confirms crossings into {target} (doc 05 §3)")
+
+    def _is_org_admin(self, cur, principal: Principal) -> bool:
+        return scopes._has_relation(
+            cur, [self.settings.org_scope_id], "owner", principal.actor
+        )
+
+    def _tombstone(self, cur, principal: Principal, mem: dict, reason: str) -> None:
+        """Hard-forget path 3 (doc 03 §6): content, embedding and (via the
+        generated column) tsv physically go; a content-free TOMBSTONE
+        event keeps the audit chain intact (doc 06 §2)."""
+        cur.execute(
+            "UPDATE memories SET status='tombstoned', content='', content_embedding=NULL"
+            " WHERE id=%s",
+            (mem["id"],),
+        )
+        self._event(cur, principal, "TOMBSTONE", memory_id=str(mem["id"]),
+                    scope_id=mem["scope_id"], details={"from": mem["status"], "reason": reason})
+
     # ---------- internals: lifecycle (doc 03) ----------
 
     def _find_duplicate(self, cur, chain: list[str], content: str) -> dict | None:
@@ -836,8 +1482,8 @@ class MemoryService:
     def _require_reviewer(self, cur, principal: Principal, scope_id: str) -> None:
         """Triage and confirmations are human actions: the reviewing user
         must be able to see the scope (doc 05 §3 confirmers) or hold the
-        auditor relation. Agents relay `ask` prompts (P3); they do not
-        confirm."""
+        auditor relation. Agents relay `ask` prompts and answers
+        (confirm_pending); the decision recorded is the human's."""
         if scopes.is_auditor(cur, principal, self.settings.org_scope_id):
             return
         user = principal.effective_user

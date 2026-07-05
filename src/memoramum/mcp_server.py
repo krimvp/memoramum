@@ -1,9 +1,9 @@
 """MCP facade (ADR-0005): the primary agent-facing surface.
 
-P2 exposes four tools — memory_remember, memory_recall, memory_reinforce,
-memory_status (doc 07 §6) — plus the prompt contract of doc 04 §4 as an
-MCP prompt. The remaining tools (promote, confirm, forget) arrive with the
-phases that give them semantics (P3 policy flows, P4 forgetting).
+P3 exposes six tools — memory_remember, memory_recall, memory_reinforce,
+memory_status, plus the policy flows memory_promote and memory_confirm
+(doc 07 §6) — and the prompt contract of doc 04 §4 as an MCP prompt.
+memory_forget arrives in P4 with the forgetting pipeline.
 
 One server process serves one session context: the principal pair and the
 flow (surface, container, participants) come from the environment the
@@ -105,6 +105,24 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         status); signal='wrong' when it misled — that lowers confidence and
         queues it for contradiction review, no forget powers needed."""
         return service.reinforce(principal, flow, memory_id=memory_id, signal=signal, note=note)
+
+    @mcp.tool()
+    def memory_promote(memory_id: str, target_scope: str, justification: str = "") -> dict:
+        """Move a memory to a broader scope (e.g. channel → workspace) or a
+        subject scope. Almost always returns `ask` — relay the ask_prompt to
+        the human verbatim and close it with memory_confirm. The one tool
+        where you name a scope; the service validates you may write there."""
+        return service.promote(
+            principal, flow, memory_id=memory_id, target_scope=target_scope,
+            justification=justification,
+        )
+
+    @mcp.tool()
+    def memory_confirm(pending_id: str, approved: bool, note: str = "") -> dict:
+        """Close an `ask`: relay the user's answer to a pending question from
+        memory_remember or memory_promote. Only report what the user actually
+        said — the confirmation is recorded as the human's decision."""
+        return service.confirm_pending(principal, pending_id, approved=approved, note=note)
 
     @mcp.tool()
     def memory_status(

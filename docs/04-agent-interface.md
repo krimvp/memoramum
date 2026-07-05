@@ -184,6 +184,9 @@ The contract is persuasive; the *enforcement* is server-side policy ([doc 05](05
 | `GET /v1/scopes/{id}/memories` | scope inventory (channel admin view) |
 | `GET /v1/review/staged` / `POST /v1/memories/{id}/review` | staged-triage queue; confirm/reject by a scope member ([doc 03 §4](03-lifecycle.md)) |
 | `GET /v1/review/contradictions` / `POST /v1/review/contradictions/{id}` | held-contradiction queue; resolve supersede / keep-both / reject ([doc 03 §3](03-lifecycle.md)) |
+| `GET /v1/review/pending` / `POST /v1/review/pending/{id}` | open `ask` confirmations; approve/decline by the confirmer ([doc 05 §3](05-policy.md)) |
+| `GET /v1/policies` / `POST /v1/policies` | versioned policy documents, YAML in / canonical JSON out ([doc 05 §5](05-policy.md)) |
+| `POST /v1/policies/simulate` | simulation mode: evaluate a proposed policy against recent decisions ([doc 05 §5](05-policy.md)) |
 | `POST /v1/erasure-requests` | GDPR pipeline ([doc 06 §2](06-audit-privacy-security.md)) |
 | `POST /v1/quarantine` | provenance-based bulk revoke ([doc 06 §3](06-audit-privacy-security.md)) |
 | `GET /v1/audit/events` | filtered event-log queries (admin) |
