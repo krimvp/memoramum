@@ -17,7 +17,7 @@ AS_SYSTEM = {"X-Memoramum-Actor": "system:ingest"}
 
 
 def test_healthz(client):
-    assert client.get("/healthz").json() == {"ok": True, "phase": "P2"}
+    assert client.get("/healthz").json() == {"ok": True, "phase": "P3"}
 
 
 def test_episode_and_context_block_roundtrip(client):
@@ -95,6 +95,48 @@ def test_review_surface_roundtrip(client, svc):
     denied = client.post(f"/v1/memories/{mid}/review", headers=AS_SAGE_FOR_DANA,
                          json={"action": "confirm"})
     assert denied.status_code == 403
+
+
+def test_policy_and_pending_surface(client, svc):
+    """The P3 admin surface: policy documents (YAML in), simulation, and
+    the ask-confirmation queue (doc 05 §5, doc 04 §5)."""
+    from conftest import DEPLOYS_FLOW, SYSTEM
+    from memoramum.principals import Principal
+    as_root = {"X-Memoramum-Actor": "user:root"}
+    as_dana = {"X-Memoramum-Actor": "user:dana"}
+
+    yaml_doc = """
+policy: resty-default
+layer: agent
+applies_to: agent:resty
+learning:
+  strategies:
+    - { name: careful, origin_kinds: [explicit_user_ask], decision: ask }
+"""
+    put = client.post("/v1/policies", headers=as_root, json={"document": yaml_doc})
+    assert put.status_code == 200 and put.json()["version"] >= 1
+    assert client.post("/v1/policies", headers=as_dana,
+                       json={"document": yaml_doc}).status_code == 403
+    listed = client.get("/v1/policies", headers=as_root).json()
+    assert "resty-default" in {p["name"] for p in listed}
+
+    sim = client.post("/v1/policies/simulate", headers=AS_ADMIN,
+                      json={"document": yaml_doc, "days": 30})
+    assert sim.status_code == 200 and "summary" in sim.json()
+
+    svc.set_relation(SYSTEM, "channel/C0DEP", "reader_agent", "agent:resty")
+    svc.set_relation(SYSTEM, "channel/C0DEP", "writer_agent", "agent:resty")
+    ask = svc.remember(
+        Principal("agent:resty", "user:dana"), DEPLOYS_FLOW,
+        content="Release notes get a summary thread in the channel",
+        kind="semantic", origin_kind="explicit_user_ask",
+    )
+    assert ask["decision"] == "ask"
+    queue = client.get("/v1/review/pending", headers=as_dana).json()
+    assert ask["pending_id"] in {p["id"] for p in queue}
+    out = client.post(f"/v1/review/pending/{ask['pending_id']}", headers=as_dana,
+                      json={"approved": True})
+    assert out.status_code == 200 and out.json()["status"] == "active"
 
 
 def test_later_phase_endpoints_are_honest(client):

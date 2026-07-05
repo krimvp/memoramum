@@ -160,6 +160,25 @@ def resolve_chain(cur, principal: Principal, flow: Flow) -> list[str]:
                 continue  # structural node, not a memory home (doc 01 §3.3 example)
             chain.append(scope["id"])
 
+    # Shared scopes the agent is *directly* enrolled in on another surface
+    # (README scenario step 4: "repo → org + relevant shared scopes it is
+    # enrolled in"; doc 01 §5: "Marge's scope chain includes the shared
+    # scope"). Direct tuples only, cross-surface only: inherited org-wide
+    # enrollment must not pull every descendant container into the chain —
+    # that would defeat the doc 01 §3.3 isolation example — and same-surface
+    # sibling containers stay out of each other's chains.
+    if principal.kind == "agent":
+        for row in cur.execute(
+            "SELECT r.scope_id FROM scope_relations r JOIN scopes s ON s.id = r.scope_id"
+            " WHERE r.principal = %s AND r.relation = 'reader_agent'"
+            " AND s.family = 'container' AND s.trust_class <> 'private'"
+            " AND s.surface IS NOT NULL AND s.surface IS DISTINCT FROM %s"
+            " ORDER BY r.scope_id",
+            (principal.actor, flow.surface),
+        ).fetchall():
+            if row["scope_id"] not in chain:
+                chain.append(row["scope_id"])
+
     # Participants' subject scopes (policy-gated; readable() below enforces
     # that in P1 only the subject themself unlocks their subject scope).
     participants = list(flow.participants)

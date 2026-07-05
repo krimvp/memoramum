@@ -83,6 +83,9 @@ def _seed(svc: MemoryService) -> None:
     r(SYSTEM, "channel/C0DEP", "reader_agent", "agent:sage")
     r(SYSTEM, "channel/C0DEP", "writer_agent", "agent:sage")
     r(SYSTEM, "workspace/T024B", "reader_agent", "agent:sage")
+    # The promotion target must be on the writable set (doc 04 §1): sage
+    # may address workspace-level scopes, humans still confirm crossings.
+    r(SYSTEM, "workspace/T024B", "writer_agent", "agent:sage")
     r(SYSTEM, "subject:user/dana", "reader_agent", "agent:sage")
     r(SYSTEM, "subject:user/dana", "writer_agent", "agent:sage")
     r(SYSTEM, "org:acme", "reader_agent", "agent:marge")
@@ -90,3 +93,4 @@ def _seed(svc: MemoryService) -> None:
 
     r(SYSTEM, "subject:user/dana", "owner", "user:dana")
     r(SYSTEM, "org:acme", "auditor", "user:admin")
+    r(SYSTEM, "org:acme", "owner", "user:root")   # the org admin (policy administration, doc 05 §5)

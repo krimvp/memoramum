@@ -1,11 +1,13 @@
-"""The consolidator (doc 07 §2) — the P2 job subset.
+"""The consolidator (doc 07 §2) — the P2–P3 job subset.
 
 The system's sleep-time worker: memory quality is produced offline so the
-hot path stays fast and dumb. P2 runs **status promotion**, **contradiction
-review** (escalate / archive timers; the weighing itself is human via the
-review surface until the P4 LLM jobs land), and the **decay & TTL sweeps**
-of doc 03 §5. Dedupe/merge and reflection/summarization arrive in P4 with
-the full job set.
+hot path stays fast and dumb. P2 brought **status promotion**,
+**contradiction review** (escalate / archive timers; the weighing itself
+is human via the review surface until the P4 LLM jobs land), and the
+**decay & TTL sweeps** of doc 03 §5; P3 teaches the TTL sweep the
+per-category retention overrides (tombstone at expiry where policy
+demands hard deletion). Dedupe/merge and reflection/summarization arrive
+in P4 with the full job set.
 
 It acts as `system:consolidator`: every action is evented like any
 principal. All jobs are idempotent — a wedged consolidator degrades
@@ -17,7 +19,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from . import lifecycle, retrieval
+from . import lifecycle, policy, retrieval
 from .principals import Principal
 from .service import MemoryService
 
@@ -127,17 +129,30 @@ class Consolidator:
                     archived.append(str(row["id"]))
             out["decay_flagged"], out["decay_archived"] = flagged, archived
 
-            # Policy TTL reached → archive. (Per-category tombstone modes
-            # arrive with the P3 retention overrides; nothing sets
-            # expires_at before then.)
+            # Policy TTL reached → archive, or tombstone where a retention
+            # override demands hard deletion at expiry (doc 03 §5, e.g.
+            # anything tagged `health`).
             expired = cur.execute(
-                "SELECT * FROM memories WHERE expires_at IS NOT NULL AND expires_at <= %s"
-                " AND status IN ('staged','active','invariant')",
+                "SELECT m.*, p.responsible_agent, s.surface FROM memories m"
+                " LEFT JOIN memory_provenance p ON p.memory_id = m.id"
+                " LEFT JOIN scopes s ON s.id = m.scope_id"
+                " WHERE m.expires_at IS NOT NULL AND m.expires_at <= %s"
+                " AND m.status IN ('staged','active','invariant')",
                 (now,),
             ).fetchall()
+            out["ttl"], out["ttl_tombstoned"] = [], []
             for row in expired:
-                self.svc._archive(cur, CONSOLIDATOR, row, "expires_at reached")
-            out["ttl"] = [str(r["id"]) for r in expired]
+                layers = self.svc._layers(
+                    cur, agent=row["responsible_agent"] or "system:consolidator",
+                    surface=row["surface"], subjects=row["subject_ids"],
+                )
+                override = policy.retention_override(layers, list(row["categories"]))
+                if override and override["expiry_mode"] == "tombstone":
+                    self.svc._tombstone(cur, CONSOLIDATOR, row, "expires_at reached")
+                    out["ttl_tombstoned"].append(str(row["id"]))
+                else:
+                    self.svc._archive(cur, CONSOLIDATOR, row, "expires_at reached")
+                    out["ttl"].append(str(row["id"]))
 
             # Deprecated older than the history-retention window → archive.
             stale = cur.execute(

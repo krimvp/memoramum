@@ -35,6 +35,9 @@ def retention(row: dict[str, Any], settings: Settings, now: datetime | None = No
     return math.exp(-t_days / s_days)
 
 
+_SENSITIVITIES = ("public", "internal", "confidential", "restricted")
+
+
 def _candidate_filters(
     *,
     include_staged: bool,
@@ -42,10 +45,21 @@ def _candidate_filters(
     subjects: list[str] | None,
     trust_floor: float,
     as_of: datetime | None,
+    sensitivity_ceiling: str | None,
+    deny_categories: list[str] | None,
 ) -> tuple[str, list]:
     statuses = ["active", "invariant"] + (["staged"] if include_staged else [])
     where = ["m.scope_id = ANY(%s)", "m.trust_score >= %s"]
     params: list = [None, trust_floor]  # scope chain patched in by caller
+    if sensitivity_ceiling is not None and sensitivity_ceiling != "restricted":
+        # The read-side attribute rules (doc 05 §4.2) filter candidates,
+        # never post-filter an over-fetched set (doc 04 §3).
+        allowed = list(_SENSITIVITIES[: _SENSITIVITIES.index(sensitivity_ceiling) + 1])
+        where.append("m.sensitivity = ANY(%s)")
+        params.append(allowed)
+    if deny_categories:
+        where.append("NOT (m.categories && %s)")
+        params.append(list(deny_categories))
     if as_of is None:
         where.append("m.status = ANY(%s)")
         params.append(statuses)
@@ -87,6 +101,8 @@ def search(
     include_staged: bool = True,
     trust_floor: float | None = None,
     as_of: datetime | None = None,
+    sensitivity_ceiling: str | None = None,
+    deny_categories: list[str] | None = None,
     limit: int = 8,
 ) -> list[dict[str, Any]]:
     """Returns memory rows with a `score` key, best first."""
@@ -96,6 +112,7 @@ def search(
     where, params = _candidate_filters(
         include_staged=include_staged, kinds=kinds, subjects=subjects,
         trust_floor=floor, as_of=as_of,
+        sensitivity_ceiling=sensitivity_ceiling, deny_categories=deny_categories,
     )
 
     ranks: dict[str, dict[str, int]] = {}
