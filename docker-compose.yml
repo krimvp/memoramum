@@ -1,0 +1,14 @@
+# Dev database (ADR-0004 reference stack: one Postgres 16 + pgvector).
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: memoramum
+      POSTGRES_PASSWORD: memoramum
+      POSTGRES_DB: memoramum
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:

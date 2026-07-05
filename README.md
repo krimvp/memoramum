@@ -2,7 +2,7 @@
 
 Memoramum is the design for a **standalone memory service** that lets heterogeneous AI agents — a Slack assistant, an MR-review agent, tomorrow's surfaces — **learn, remember, and forget**, under an explicit policy, with every memory **auditable** from the moment it was proposed to the moment it was erased.
 
-This repository currently contains the architecture and design documentation. There is no implementation yet; the docs are written so that implementation can start from them directly.
+This repository contains the architecture and design documentation, and a **reference implementation** that follows the design's phased rollout ([doc 07 §6](docs/07-operations.md)) — currently at **P1** (remember & recall, audited). The docs are normative; the code implements them.
 
 ## Why this exists
 
@@ -39,6 +39,18 @@ One scenario threads through every document, so each mechanism can be seen end-t
 | [07 — Operations](docs/07-operations.md) | The consolidator, reference stack, observability, phased rollout |
 | [Appendix — Prior art](docs/appendix-prior-art.md) | Survey of Letta, Mem0, Zep/Graphiti, LangMem, product memory systems, academic work — and what we took from each |
 | [ADRs](docs/adr/) | One-page records for the contested decisions |
+
+## The reference implementation
+
+`src/memoramum/` implements the design phase by phase (stack decision: [ADR-0007](docs/adr/0007-python-reference-implementation.md); Python + one Postgres 16/pgvector, FastAPI REST facade, MCP facade). **P1** is implemented: the four core tables exactly as specified in [doc 02](docs/02-data-model.md), episodes, `explicit_user_ask` writes, `memory_remember` / `memory_recall` / `memory_status` over MCP, the context block and platform endpoints of [doc 04](docs/04-agent-interface.md), the scope tree + enrollment with retrieval-time access checks, and the full event log including `READ`s (with the subject-scope hash chain). P2–P4 surface (the staged tier via policy, reinforcement, promotion, erasure) is stubbed honestly — denied or `501`, each pointing at its phase.
+
+```bash
+make venv     # python -m venv + pip install -e '.[dev]'
+make db       # docker compose up postgres (16 + pgvector)
+make migrate  # apply src/memoramum/migrations/ (the doc 02 DDL, verbatim)
+make test     # integration tests incl. the P1 exit criteria of doc 07 §6
+make api      # REST facade on :8385; memoramum-mcp is the agent facade
+```
 
 ## Glossary
 

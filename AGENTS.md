@@ -2,14 +2,23 @@
 
 ## What this repository is
 
-Memoramum is a **design-documentation-only** repository: the architecture for a standalone
-memory service for AI agents. There is **no implementation, no build, no tests, no
-dependencies**. The deliverable is the prose. "Working on this repo" means reading,
-writing, and keeping ~1,300 lines of tightly cross-referenced Markdown mutually consistent.
+Memoramum is the design for a standalone memory service for AI agents, plus a **reference
+implementation that follows the design's phased rollout** (doc 07 §6) — currently at **P1**.
+The ~1,300 lines of tightly cross-referenced Markdown remain the **normative** artifact:
+code implements the docs, never the other way around. "Working on this repo" means keeping
+the docs mutually consistent *and* keeping `src/` an exact implementation of them.
 
 ```
 README.md                     entry point: pitch, worked scenario, doc map, GLOSSARY (normative)
 index.html                    self-contained static page: high-level design overview
+pyproject.toml, Makefile      Python package + dev entry points (venv/db/migrate/test/api)
+docker-compose.yml            dev Postgres 16 + pgvector (ADR-0004 stack)
+src/memoramum/                reference implementation, P1 (ADR-0007):
+                              migrations/ = the doc 02 DDL verbatim; service.py = API core;
+                              rest.py / mcp_server.py = the two facades (ADR-0005);
+                              scopes.py, events.py, policy.py, retrieval.py = docs 01/02/05/04
+tests/                        integration tests against real Postgres, incl. the P1 exit
+                              criteria of doc 07 §6 (worked-scenario steps 1-explicit and 6)
 docs/
   01-concepts-and-scopes.md   core nouns; the scope tree; scope chains; principals
   02-data-model.md            reference Postgres DDL: scopes, memories, episodes,
@@ -24,7 +33,7 @@ docs/
                               PII pipeline
   07-operations.md            components, consolidator jobs, reference stack, SLOs, rollout
   appendix-prior-art.md       survey of Letta, Mem0, Zep/Graphiti, LangMem, etc.
-  adr/000N-*.md               one-page records of the contested decisions (6 so far)
+  adr/000N-*.md               one-page records of the contested decisions (7 so far)
 ```
 
 Read `README.md` first, then docs in numeric order — each ends with a "Continue with"
@@ -99,7 +108,9 @@ the docs back.
 
 ## Validation
 
-There is no build or test suite. Verification means:
+For code: `make test` — integration tests against a real Postgres with pgvector (start one
+with `make db`, or point `MEMORAMUM_TEST_DATABASE_URL` at yours). The suite doubles as the
+P1 exit-criteria check. For docs, verification means:
 
 - **Links**: a `PostToolUse` hook (`.claude/hooks/check-markdown-links.py`) checks every
   relative link and `#anchor` in a Markdown file you edit and reports breakage
@@ -110,8 +121,10 @@ There is no build or test suite. Verification means:
 
 ## What NOT to do
 
-- Do not add implementation code, package manifests, or CI for code — this repo stays
-  docs-only until the design says otherwise (phased rollout is doc 07 §6).
+- Do not let the implementation outrun the rollout phase (doc 07 §6): later-phase surface
+  is stubbed honestly (`deny` verdicts, HTTP 501, "arrives in Pn" reasons), never
+  half-built. When code and docs disagree, the docs win — fix the code, or change the docs
+  first (with an ADR if the disagreement is a design change).
 - Do not "modernize" vocabulary or restructure docs wholesale; numbering and anchors are
   load-bearing (external references point at them).
 - Do not soften the stated design stances (e.g. residual poisoning risk in doc 06 §3 is

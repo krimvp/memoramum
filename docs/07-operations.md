@@ -87,7 +87,7 @@ Decision recorded in [ADR-0004](adr/0004-postgres-reference-stack.md); summary:
 
 ## 6. Phased rollout
 
-Each phase is shippable and useful on its own; nothing later requires reworking earlier data (the schema carries all fields from day one; later phases *populate* them).
+Each phase is shippable and useful on its own; nothing later requires reworking earlier data (the schema carries all fields from day one; later phases *populate* them). The reference implementation in `src/` lands strictly by these phases ([ADR-0007](adr/0007-python-reference-implementation.md)).
 
 | Phase | Scope | Exit criteria |
 |---|---|---|
