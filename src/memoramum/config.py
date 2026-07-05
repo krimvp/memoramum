@@ -28,6 +28,36 @@ class Settings:
     # PII analyzer (doc 06 §4): 'regex' (deterministic pattern stand-in for
     # a Presidio-class model — same seam) or 'none' (scanning off).
     pii_analyzer: str = field(default_factory=lambda: os.environ.get("MEMORAMUM_PII", "regex"))
+    # Background extraction (doc 07 §1): 'marker' (deterministic dev
+    # stand-in — standing statements flagged by their author) or 'none'
+    # (extraction off). A model extractor slots in behind the same seam.
+    extractor: str = field(default_factory=lambda: os.environ.get("MEMORAMUM_EXTRACTOR", "marker"))
+    # Reflection/summarization (doc 07 §2): 'none' (off — reflection is
+    # LLM-shaped work, like the judge) or 'theme' (deterministic dev
+    # stand-in clustering episodic memories by categories + subjects).
+    reflector: str = field(default_factory=lambda: os.environ.get("MEMORAMUM_REFLECTOR", "none"))
+
+    # Extraction debounce (doc 07 §1): accumulate, run at conversation-lull,
+    # never wait past the cap.
+    extraction_debounce_minutes: int = 30
+    extraction_cap_hours: int = 4
+
+    # Reflection: minimum cluster of related episodic memories to distill.
+    reflection_min_cluster: int = 3
+
+    # Poisoning anomaly checks (doc 06 §3 detection, doc 07 §2 hygiene).
+    anomaly_author_daily_writes: int = 30    # staged writes traced to one author per 24 h
+    outlier_min_scope_size: int = 5          # embedding-outlier check needs a population
+    # Cosine distance from the scope centroid that counts as an outlier.
+    # Real embeddings cluster far tighter than this; the dev hash embedder
+    # is near-orthogonal noise, so the default is deliberately high.
+    outlier_distance: float = 0.9
+
+    # Erasure attestations (doc 06 §2.2 step 5) are HMAC-signed with this
+    # key; a real deployment injects one (MEMORAMUM_ATTESTATION_KEY).
+    attestation_key: str = field(
+        default_factory=lambda: os.environ.get("MEMORAMUM_ATTESTATION_KEY", "dev-attestation-key")
+    )
 
     # Status-promotion rule, doc 03 §4 defaults (global; the doc's
     # "per-category tunable" remains future policy surface).

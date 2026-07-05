@@ -11,9 +11,11 @@ of doc 05 §4.2 (sensitivity ceilings, trust floors, category deny-lists),
 per-category retention overrides, and simulation support (doc 05 §5).
 
 The org layer falls back to a built-in baseline when no org policy
-document is stored: secrets denied at the floor, `explicit_user_ask`
-allowed, `llm_inferred` staged (ADR-0003), and the P4 origins denied
-until the phase that gives them semantics.
+document is stored: secrets denied at the floor, and every origin kind
+carrying its doc 03 §2 entry semantics — `explicit_user_ask` allowed,
+`llm_inferred` and `agent_observed` staged (ADR-0003), `consolidated`
+allowed (the write path computes the weakest-input entry tier),
+`imported` staged. Anything else stays default-deny.
 """
 
 from __future__ import annotations
@@ -154,9 +156,32 @@ BUILTIN_ORG_LAYER = PolicyLayer(
             reason="agent judgment mid-conversation: useful immediately, trusted later (doc 03 §2)",
         ),
         Strategy(
-            name="p3-default",
-            decision="deny",
-            reason="agent_observed extraction, consolidated and imported writes arrive in P4 (doc 07 §6)",
+            name="observed-stage",
+            decision="stage",
+            origin_kinds=("agent_observed",),
+            reason="background extraction over third-party messages is the main"
+                   " poisoning surface — staged by default (doc 03 §2, ADR-0003)",
+        ),
+        Strategy(
+            name="consolidated-procedural",
+            decision="ask",
+            kinds=("procedural",),
+            origin_kinds=("consolidated",),
+            reason="reflection-produced procedural candidates default to ask —"
+                   " they steer behavior (doc 07 §2)",
+        ),
+        Strategy(
+            name="consolidated",
+            decision="allow",
+            origin_kinds=("consolidated",),
+            reason="consolidator output; the entry tier and trust inherit from"
+                   " the weakest input (doc 03 §2, doc 06 §3)",
+        ),
+        Strategy(
+            name="imported-stage",
+            decision="stage",
+            origin_kinds=("imported",),
+            reason="bulk imports are unaudited by definition — staged by default (doc 03 §2)",
         ),
     ),
 )

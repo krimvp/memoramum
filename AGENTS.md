@@ -3,7 +3,8 @@
 ## What this repository is
 
 Memoramum is the design for a standalone memory service for AI agents, plus a **reference
-implementation that follows the design's phased rollout** (doc 07 §6) — currently at **P3**.
+implementation that follows the design's phased rollout** (doc 07 §6) — currently at **P4**,
+the final phase.
 The ~1,300 lines of tightly cross-referenced Markdown remain the **normative** artifact:
 code implements the docs, never the other way around. "Working on this repo" means keeping
 the docs mutually consistent *and* keeping `src/` an exact implementation of them.
@@ -11,18 +12,20 @@ the docs mutually consistent *and* keeping `src/` an exact implementation of the
 ```
 README.md                     entry point: pitch, worked scenario, doc map, GLOSSARY (normative)
 index.html                    self-contained static page: high-level design overview
-pyproject.toml, Makefile      Python package + dev entry points (venv/db/migrate/test/api/consolidate)
+pyproject.toml, Makefile      Python package + dev entry points (venv/db/migrate/test/api/
+                              consolidate/extract)
 docker-compose.yml            dev Postgres 16 + pgvector (ADR-0004 stack)
-src/memoramum/                reference implementation, P3 (ADR-0007):
+src/memoramum/                reference implementation, P4 (ADR-0007):
                               migrations/ = the doc 02 DDL verbatim (plus operational tables);
                               service.py = API core; rest.py / mcp_server.py = the two facades
                               (ADR-0005); scopes.py, events.py, policy.py, retrieval.py =
                               docs 01/02/05/04; lifecycle.py = the doc 03 rules (judge,
                               reinforcement, promotion); pii.py = the doc 06 §4 pipeline;
-                              consolidator.py = the doc 07 §2 job subset for P2–P3
-tests/                        integration tests against real Postgres, incl. the P1–P3 exit
-                              criteria of doc 07 §6 (worked-scenario steps 1-explicit, 3–4,
-                              5 and 6, plus policy simulation mode)
+                              extraction.py = the doc 07 §1 workers; consolidator.py = the
+                              full doc 07 §2 job set; erasure.py = the doc 06 §2 pipeline
+tests/                        integration tests against real Postgres, incl. the P1–P4 exit
+                              criteria of doc 07 §6 (test_worked_scenario.py = the full
+                              6-step scenario across Slack + GitLab)
 docs/
   01-concepts-and-scopes.md   core nouns; the scope tree; scope chains; principals
   02-data-model.md            reference Postgres DDL: scopes, memories, episodes,

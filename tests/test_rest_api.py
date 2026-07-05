@@ -17,7 +17,7 @@ AS_SYSTEM = {"X-Memoramum-Actor": "system:ingest"}
 
 
 def test_healthz(client):
-    assert client.get("/healthz").json() == {"ok": True, "phase": "P3"}
+    assert client.get("/healthz").json() == {"ok": True, "phase": "P4"}
 
 
 def test_episode_and_context_block_roundtrip(client):
@@ -139,6 +139,18 @@ learning:
     assert out.status_code == 200 and out.json()["status"] == "active"
 
 
-def test_later_phase_endpoints_are_honest(client):
-    assert client.post("/v1/erasure-requests").status_code == 501
-    assert client.post("/v1/quarantine").status_code == 501
+def test_incident_and_erasure_endpoints_are_gated(client):
+    """The P4 surface exists and is privileged (doc 06 §2–3): incident
+    levers and erasure are not agent powers."""
+    denied = client.post("/v1/quarantine", headers=AS_SAGE_FOR_DANA,
+                         json={"author": "user:eve"})
+    assert denied.status_code == 403
+    assert client.get("/v1/quarantine", headers=AS_SAGE_FOR_DANA).status_code == 403
+    denied = client.post("/v1/erasure-requests", headers=AS_SAGE_FOR_DANA,
+                         json={"subject": "user:li"})
+    assert denied.status_code == 403
+    denied = client.post("/v1/agents/agent:sage/freeze", headers=AS_SAGE_FOR_DANA,
+                         json={"frozen": True})
+    assert denied.status_code == 403
+    # An empty quarantine predicate is refused, even for an admin.
+    assert client.post("/v1/quarantine", headers=AS_ADMIN, json={}).status_code == 400

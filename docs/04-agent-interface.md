@@ -187,8 +187,11 @@ The contract is persuasive; the *enforcement* is server-side policy ([doc 05](05
 | `GET /v1/review/pending` / `POST /v1/review/pending/{id}` | open `ask` confirmations; approve/decline by the confirmer ([doc 05 §3](05-policy.md)) |
 | `GET /v1/policies` / `POST /v1/policies` | versioned policy documents, YAML in / canonical JSON out ([doc 05 §5](05-policy.md)) |
 | `POST /v1/policies/simulate` | simulation mode: evaluate a proposed policy against recent decisions ([doc 05 §5](05-policy.md)) |
-| `POST /v1/erasure-requests` | GDPR pipeline ([doc 06 §2](06-audit-privacy-security.md)) |
+| `POST /v1/memories/{id}/forget` | user/review-UI forget ([doc 03 §6](03-lifecycle.md); agents use the `memory_forget` tool) |
+| `POST /v1/erasure-requests` / `GET /v1/erasure-requests/{id}` | GDPR pipeline; completed requests carry the signed attestation ([doc 06 §2](06-audit-privacy-security.md)) |
 | `POST /v1/quarantine` | provenance-based bulk revoke ([doc 06 §3](06-audit-privacy-security.md)) |
+| `GET /v1/quarantine` / `POST /v1/quarantine/{id}` | quarantined-lineage review: restore or tombstone ([doc 06 §3](06-audit-privacy-security.md)) |
+| `POST /v1/agents/{agent}/freeze` | break-glass write-freeze ([doc 05 §5](05-policy.md)) |
 | `GET /v1/audit/events` | filtered event-log queries (admin) |
 
 Continue with [doc 05 — Policy](05-policy.md): the layer that decides every verdict this interface returns.

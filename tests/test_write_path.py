@@ -1,6 +1,6 @@
-"""The P2 write pipeline: explicit_user_ask lands active with full
-provenance, llm_inferred routes to the staged tier (ADR-0003), and
-everything later-phase is denied — as an event, not a shrug."""
+"""The write pipeline: explicit_user_ask lands active with full
+provenance, llm_inferred and agent_observed route to the staged tier
+(ADR-0003), and denials are events, not shrugs."""
 
 from conftest import DEPLOYS_FLOW, SAGE_FOR_DANA, ADMIN
 
@@ -40,21 +40,18 @@ def test_inferred_writes_route_to_the_staged_tier(svc):
     assert verdict["memory_id"] is not None
 
 
-def test_later_phase_origins_denied_in_p2(svc):
+def test_observed_writes_route_to_the_staged_tier(svc):
+    """agent_observed gained its write path in P4 (doc 07 §6): staged by
+    default — extraction over third-party messages is the main poisoning
+    surface (doc 03 §2)."""
     verdict = svc.remember(
         SAGE_FOR_DANA, DEPLOYS_FLOW,
-        content="Background extraction has no write path yet",
+        content="Deploy dashboards get pinned to the channel",
         kind="semantic", origin_kind="agent_observed",
     )
-    assert verdict["decision"] == "deny"
-    assert verdict["memory_id"] is None
-    assert "P4" in verdict["reason"]
-    # Denials are queryable: "what has agent X been prevented from learning".
-    denials = [
-        e for e in svc.audit_events(ADMIN, action="POLICY_DECISION", actor="agent:sage")
-        if e["details"]["verdict"] == "deny"
-    ]
-    assert denials
+    assert verdict["decision"] == "stage"
+    assert verdict["status"] == "staged"
+    assert verdict["rule_id"].startswith("org/observed-stage")
 
 
 def test_secrets_denied_even_when_explicitly_asked(svc):
@@ -65,6 +62,12 @@ def test_secrets_denied_even_when_explicitly_asked(svc):
     )
     assert verdict["decision"] == "deny"
     assert "org floor" in verdict["reason"]
+    # Denials are queryable: "what has agent X been prevented from learning".
+    denials = [
+        e for e in svc.audit_events(ADMIN, action="POLICY_DECISION", actor="agent:sage")
+        if e["details"]["verdict"] == "deny"
+    ]
+    assert denials
 
 
 def test_unenrolled_agent_cannot_write(svc):

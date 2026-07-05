@@ -1,9 +1,9 @@
 """MCP facade (ADR-0005): the primary agent-facing surface.
 
-P3 exposes six tools — memory_remember, memory_recall, memory_reinforce,
-memory_status, plus the policy flows memory_promote and memory_confirm
-(doc 07 §6) — and the prompt contract of doc 04 §4 as an MCP prompt.
-memory_forget arrives in P4 with the forgetting pipeline.
+P4 completes the doc 04 §1 tool surface: the six verbs —
+memory_remember, memory_recall, memory_reinforce, memory_forget,
+memory_promote, memory_status — plus memory_confirm (the closing half of
+every `ask`), and the prompt contract of doc 04 §4 as an MCP prompt.
 
 One server process serves one session context: the principal pair and the
 flow (surface, container, participants) come from the environment the
@@ -105,6 +105,17 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         status); signal='wrong' when it misled — that lowers confidence and
         queues it for contradiction review, no forget powers needed."""
         return service.reinforce(principal, flow, memory_id=memory_id, signal=signal, note=note)
+
+    @mcp.tool()
+    def memory_forget(memory_id: str, reason: str = "", mode: str = "archive") -> dict:
+        """Forget a memory (mode 'archive', or 'tombstone' for hard
+        erasure). Policy-gated: on your own you may only forget memories
+        in your own agent scope or ones you authored that are still
+        staged — anything else returns `ask`; relay the ask_prompt and
+        close it with memory_confirm. Use with the user's ask ("forget
+        that") to fulfil a user forget — never claim to have forgotten
+        unless the tool confirmed it."""
+        return service.forget(principal, flow, memory_id=memory_id, reason=reason, mode=mode)
 
     @mcp.tool()
     def memory_promote(memory_id: str, target_scope: str, justification: str = "") -> dict:

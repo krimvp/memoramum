@@ -1,13 +1,24 @@
-"""The consolidator (doc 07 §2) — the P2–P3 job subset.
+"""The consolidator (doc 07 §2) — the full job set (P4).
 
 The system's sleep-time worker: memory quality is produced offline so the
 hot path stays fast and dumb. P2 brought **status promotion**,
 **contradiction review** (escalate / archive timers; the weighing itself
-is human via the review surface until the P4 LLM jobs land), and the
-**decay & TTL sweeps** of doc 03 §5; P3 teaches the TTL sweep the
+stays human via the review surface without a model judge), and the
+**decay & TTL sweeps** of doc 03 §5; P3 taught the TTL sweep the
 per-category retention overrides (tombstone at expiry where policy
-demands hard deletion). Dedupe/merge and reflection/summarization arrive
-in P4 with the full job set.
+demands hard deletion). P4 completes the doc 07 §2 table:
+**dedupe/merge** (judge-confirmed duplicates within a scope merge into a
+consolidated successor; predecessors deprecated — Mem0's ADD/UPDATE/NOOP
+decision, moved off the write path), **reflection/summarization**
+(clusters of related episodic memories distilled into candidates that go
+through the write pipeline like any agent's; procedural outputs default
+to `ask`), and **hygiene** (reclassification after classifier upgrades,
+the doc 06 §3 poisoning anomaly checks, and orphan/ghost-vector
+verification after erasures).
+
+Reflection is LLM-shaped work; like the judge it hides behind a
+one-method seam (`Reflector`) whose default is 'none' — off without a
+model, with a deterministic 'theme' stand-in for dev and tests.
 
 It acts as `system:consolidator`: every action is evented like any
 principal. All jobs are idempotent — a wedged consolidator degrades
@@ -17,27 +28,224 @@ quality, never correctness. Run once with `memoramum-consolidate`
 
 from __future__ import annotations
 
+import json
+import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Protocol
 
 from . import lifecycle, policy, retrieval
-from .principals import Principal
+from .principals import Flow, Principal
 from .service import MemoryService
 
 CONSOLIDATOR = Principal("system:consolidator")
+
+# Staged content that reads like an instruction to the agent is the
+# poisoning shape worth flagging (doc 06 §3: "unusually directive").
+_DIRECTIVE = re.compile(
+    r"(?i)\b(always|never|ignore|disregard|instead you must|you must|from now on)\b"
+)
+
+
+# ---------- the reflection seam (doc 07 §2) ----------
+
+@dataclass(frozen=True)
+class ReflectionCandidate:
+    content: str
+    kind: str                              # 'semantic' | 'procedural'
+    source_memory_ids: tuple[str, ...]
+    categories: tuple[str, ...] = ()
+    subjects: tuple[str, ...] = ()
+    justification: str = ""
+
+
+class Reflector(Protocol):
+    version: str
+
+    def reflect(self, memories: list[dict]) -> list[ReflectionCandidate]: ...
+
+
+class NoneReflector:
+    """Reflection off (the default): distilling clusters into new
+    statements is LLM-shaped work, like the contradiction judge."""
+
+    version = "none-0"
+
+    def reflect(self, memories: list[dict]) -> list[ReflectionCandidate]:
+        return []
+
+
+class ThemeReflector:
+    """Deterministic dev/test stand-in: episodic memories sharing the same
+    categories and subjects form a theme; a big-enough theme distills into
+    one semantic candidate restating its strongest member. No semantics —
+    a model reflector slots in behind the same seam; do not deploy."""
+
+    version = "theme-1"
+
+    def __init__(self, min_cluster: int):
+        self.min_cluster = min_cluster
+
+    def reflect(self, memories: list[dict]) -> list[ReflectionCandidate]:
+        themes: dict[tuple, list[dict]] = {}
+        for m in memories:
+            key = (tuple(sorted(m["categories"])), tuple(sorted(m["subject_ids"])))
+            themes.setdefault(key, []).append(m)
+        out = []
+        for (categories, subjects), cluster in sorted(themes.items()):
+            if len(cluster) < self.min_cluster:
+                continue
+            strongest = max(cluster, key=lambda m: (m["strength"], m["recorded_at"], str(m["id"])))
+            out.append(ReflectionCandidate(
+                content=f"Recurring across related episodes: {strongest['content']}",
+                kind="semantic",
+                source_memory_ids=tuple(sorted(str(m["id"]) for m in cluster)),
+                categories=categories, subjects=subjects,
+                justification=f"distilled from {len(cluster)} related episodic memories"
+                              " (Generative-Agents reflection, doc 07 §2)",
+            ))
+        return out
+
+
+def make_reflector(name: str, min_cluster: int) -> Reflector:
+    if name == "none":
+        return NoneReflector()
+    if name == "theme":
+        return ThemeReflector(min_cluster)
+    raise ValueError(f"unknown reflector {name!r} (expected 'none' or 'theme')")
+
+
+# A join fragment: memories under an unresolved quarantine are frozen out
+# of every consolidation job, not just retrieval (doc 06 §3).
+_NOT_QUARANTINED = (
+    "NOT EXISTS (SELECT 1 FROM quarantine_items qi"
+    " WHERE qi.memory_id = m.id AND qi.resolved_at IS NULL)"
+)
 
 
 class Consolidator:
     def __init__(self, service: MemoryService):
         self.svc = service
         self.settings = service.settings
+        self.reflector = make_reflector(
+            self.settings.reflector, self.settings.reflection_min_cluster
+        )
 
     def run(self, now: datetime | None = None) -> dict:
         now = now or datetime.now(timezone.utc)
-        return {
-            "promoted": self.promote_staged(now),
+        return {  # the doc 07 §2 job order
+            "merged": self.dedupe(now),
             "contradictions": self.review_contradictions(now),
+            "promoted": self.promote_staged(now),
+            "reflected": self.reflect(now),
             "swept": self.sweep(now),
+            "hygiene": self.hygiene(now),
         }
+
+    # ---------- dedupe / merge (doc 07 §2) ----------
+
+    def dedupe(self, now: datetime) -> list[dict]:
+        """Judge-confirmed duplicates within a scope merge into one
+        consolidated successor (weakest tier, minimum trust, summed
+        reinforcement); predecessors are deprecated with the successor
+        linked. The write path already reinforces same-chain duplicates
+        (doc 03 §4) — what lands here are copies that arrived through
+        different chains, e.g. a promotion into a scope that already knew
+        the fact. Candidate generation is a per-scope pairwise pass in the
+        reference implementation (embedding-neighborhood pre-filtering is
+        an optimization, not a semantic)."""
+        merged: list[dict] = []
+        with self.svc.pool.connection() as conn:
+            cur = conn.cursor()
+            scope_ids = [r["scope_id"] for r in cur.execute(
+                "SELECT m.scope_id FROM memories m"
+                f" WHERE m.status IN ('staged','active') AND {_NOT_QUARANTINED}"
+                " GROUP BY m.scope_id HAVING count(*) > 1 ORDER BY m.scope_id",
+            ).fetchall()]
+            for scope_id in scope_ids:
+                rows = cur.execute(
+                    "SELECT m.* FROM memories m WHERE m.scope_id=%s"
+                    f" AND m.status IN ('staged','active') AND {_NOT_QUARANTINED}"
+                    " ORDER BY m.recorded_at",
+                    (scope_id,),
+                ).fetchall()
+                taken: set[str] = set()
+                for i, a in enumerate(rows):
+                    if str(a["id"]) in taken:
+                        continue
+                    group = [a]
+                    for b in rows[i + 1:]:
+                        if str(b["id"]) in taken:
+                            continue
+                        if self.svc.judge.judge(b["content"], a["content"]) == "duplicate":
+                            group.append(b)
+                            taken.add(str(b["id"]))
+                    if len(group) < 2:
+                        continue
+                    winner = max(group, key=lambda m: (
+                        m["status"] == "active", m["trust_score"], -m["recorded_at"].timestamp()
+                    ))
+                    successor = self.svc._consolidated_insert(
+                        cur, CONSOLIDATOR, group, scope_id=scope_id,
+                        content=winner["content"], kind=winner["kind"], job="dedupe",
+                        justification=f"merged {len(group)} duplicates in {scope_id}"
+                                      " (doc 07 §2 dedupe/merge)",
+                    )
+                    for m in group:
+                        cur.execute(
+                            "UPDATE memories SET status='deprecated', superseded_by=%s"
+                            " WHERE id=%s",
+                            (successor, m["id"]),
+                        )
+                        self.svc._event(
+                            cur, CONSOLIDATOR, "DEPRECATE", memory_id=str(m["id"]),
+                            scope_id=scope_id, details={"merged_into": successor},
+                        )
+                    merged.append({"scope_id": scope_id, "successor": successor,
+                                   "merged": [str(m["id"]) for m in group]})
+        return merged
+
+    # ---------- reflection / summarization (doc 07 §2) ----------
+
+    def reflect(self, now: datetime) -> list[dict]:
+        """Clusters of related episodic memories → distilled candidates.
+        Candidates go through the write pipeline like any agent's: policy
+        applies, `consolidated` procedural candidates default to `ask`
+        (the builtin org layer), and re-runs deduplicate against the
+        previous night's output."""
+        proposals: list[dict] = []
+        with self.svc.pool.connection() as conn:
+            cur = conn.cursor()
+            scope_rows = cur.execute(
+                "SELECT m.scope_id, s.surface FROM memories m JOIN scopes s ON s.id = m.scope_id"
+                " WHERE m.kind='episodic' AND m.status IN ('staged','active')"
+                f" AND {_NOT_QUARANTINED}"
+                " GROUP BY m.scope_id, s.surface HAVING count(*) >= %s ORDER BY m.scope_id",
+                (self.settings.reflection_min_cluster,),
+            ).fetchall()
+            clusters = []
+            for sr in scope_rows:
+                rows = cur.execute(
+                    "SELECT m.* FROM memories m WHERE m.scope_id=%s AND m.kind='episodic'"
+                    f" AND m.status IN ('staged','active') AND {_NOT_QUARANTINED}"
+                    " ORDER BY m.recorded_at",
+                    (sr["scope_id"],),
+                ).fetchall()
+                clusters.append((sr, self.reflector.reflect(rows)))
+        for sr, candidates in clusters:
+            flow = Flow(surface=sr["surface"], container=sr["scope_id"],
+                        session_id=f"reflection:{sr['scope_id']}")
+            for cand in candidates:
+                verdict = self.svc.remember(
+                    CONSOLIDATOR, flow, content=cand.content, kind=cand.kind,
+                    origin_kind="consolidated", subjects=list(cand.subjects),
+                    categories=list(cand.categories), justification=cand.justification,
+                    source_memory_ids=list(cand.source_memory_ids),
+                )
+                proposals.append({"scope_id": sr["scope_id"], "content": cand.content,
+                                  "decision": verdict["decision"],
+                                  "memory_id": verdict.get("memory_id")})
+        return proposals
 
     # ---------- status promotion (doc 03 §4) ----------
 
@@ -165,6 +373,124 @@ class Consolidator:
             for row in stale:
                 self.svc._archive(cur, CONSOLIDATOR, row, "history retention window passed")
             out["history_retention"] = [str(r["id"]) for r in stale]
+        return out
+
+    # ---------- hygiene (doc 07 §2, doc 06 §3–4) ----------
+
+    def hygiene(self, now: datetime) -> dict:
+        out: dict = {"reclassified": [], "quarantined": [], "flagged": [], "ghosts_repaired": []}
+        with self.svc.pool.connection() as conn:
+            cur = conn.cursor()
+
+            # Reclassification after a classifier upgrade (doc 06 §4):
+            # classifier versions live in provenance activity; a stale
+            # version gets a rescan. Content a newer classifier would have
+            # blocked is quarantined for review, never silently kept.
+            stale = cur.execute(
+                "SELECT m.*, p.activity FROM memories m"
+                " JOIN memory_provenance p ON p.memory_id = m.id"
+                " WHERE m.status IN ('staged','active','invariant')"
+                " AND p.activity ? 'classifier'"
+                " AND p.activity->>'classifier' IS DISTINCT FROM %s",
+                (self.svc.analyzer.version,),
+            ).fetchall()
+            quarantine_req = None
+            for row in stale:
+                entities = self.svc.analyzer.analyze(row["content"])
+                blockers = [e.kind for e in entities if e.kind in ("credential", "gov_id")]
+                if blockers:
+                    if quarantine_req is None:
+                        quarantine_req = str(cur.execute(
+                            "INSERT INTO quarantine_requests (predicate, requested_by, note)"
+                            " VALUES (%s,%s,%s) RETURNING id",
+                            (json.dumps({"reclassification": self.svc.analyzer.version}),
+                             CONSOLIDATOR.actor, "reclassification sweep found blockers"),
+                        ).fetchone()["id"])
+                    cur.execute(
+                        "INSERT INTO quarantine_items (request_id, memory_id)"
+                        " VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                        (quarantine_req, row["id"]),
+                    )
+                    self.svc._event(
+                        cur, CONSOLIDATOR, "QUARANTINE", memory_id=str(row["id"]),
+                        scope_id=row["scope_id"],
+                        details={"request_id": quarantine_req,
+                                 "reason": f"reclassification found {sorted(set(blockers))}"},
+                    )
+                    out["quarantined"].append(str(row["id"]))
+                cur.execute(
+                    "UPDATE memory_provenance SET activity = activity || %s WHERE memory_id=%s",
+                    (json.dumps({"classifier": self.svc.analyzer.version,
+                                 "reclassified_from": row["activity"].get("classifier")}),
+                     row["id"]),
+                )
+                out["reclassified"].append(str(row["id"]))
+
+            # Poisoning anomaly checks (doc 06 §3 detection): each flag is
+            # a PROPOSE(review) event — visible, once, into the review flow.
+            def flag(row, reason: str) -> None:
+                already = cur.execute(
+                    "SELECT 1 FROM memory_events WHERE memory_id=%s AND action='PROPOSE'"
+                    " AND details->>'proposal'='review' AND details->>'reason'=%s LIMIT 1",
+                    (row["id"], reason),
+                ).fetchone()
+                if already:
+                    return
+                self.svc._event(
+                    cur, CONSOLIDATOR, "PROPOSE", memory_id=str(row["id"]),
+                    scope_id=row["scope_id"],
+                    details={"proposal": "review", "reason": reason},
+                )
+                out["flagged"].append({"memory_id": str(row["id"]), "reason": reason})
+
+            for row in cur.execute(
+                "SELECT m.* FROM memories m WHERE m.status='staged'",
+            ).fetchall():
+                if _DIRECTIVE.search(row["content"]):
+                    flag(row, "directive_content")
+
+            spikes = cur.execute(
+                "SELECT e.author, array_agg(DISTINCT m.id) AS ids"
+                " FROM memories m"
+                " JOIN memory_derivations d ON d.memory_id = m.id AND d.source_type='episode'"
+                " JOIN episodes e ON e.id = d.source_id"
+                " WHERE m.status='staged' AND m.recorded_at >= %s AND e.author IS NOT NULL"
+                " GROUP BY e.author HAVING count(DISTINCT m.id) > %s",
+                (now - timedelta(days=1), self.settings.anomaly_author_daily_writes),
+            ).fetchall()
+            for spike in spikes:
+                for mid in spike["ids"]:
+                    row = cur.execute("SELECT * FROM memories WHERE id=%s", (mid,)).fetchone()
+                    flag(row, "write_rate_spike")
+
+            outliers = cur.execute(
+                "WITH pop AS ("
+                "  SELECT m.scope_id, avg(m.content_embedding) AS centroid, count(*) AS n"
+                "  FROM memories m WHERE m.status IN ('staged','active')"
+                "  AND m.content_embedding IS NOT NULL GROUP BY m.scope_id"
+                ") SELECT m.* FROM memories m JOIN pop ON pop.scope_id = m.scope_id"
+                " WHERE pop.n >= %s AND m.status='staged' AND m.content_embedding IS NOT NULL"
+                " AND (m.content_embedding <=> pop.centroid) > %s",
+                (self.settings.outlier_min_scope_size, self.settings.outlier_distance),
+            ).fetchall()
+            for row in outliers:
+                flag(row, "embedding_outlier")
+
+            # Orphan/ghost-vector verification after erasures (doc 06 §2):
+            # a tombstone with content or a vector left behind is a bug —
+            # repair it and leave the repair on the record.
+            ghosts = cur.execute(
+                "UPDATE memories SET content='', content_embedding=NULL"
+                " WHERE status='tombstoned' AND (content <> '' OR content_embedding IS NOT NULL)"
+                " RETURNING id, scope_id",
+            ).fetchall()
+            for g in ghosts:
+                self.svc._event(
+                    cur, CONSOLIDATOR, "TOMBSTONE", memory_id=str(g["id"]),
+                    scope_id=g["scope_id"],
+                    details={"repair": True, "reason": "ghost content/vector found by hygiene"},
+                )
+                out["ghosts_repaired"].append(str(g["id"]))
         return out
 
 

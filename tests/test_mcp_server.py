@@ -1,4 +1,5 @@
-"""The MCP facade: exactly the six P3 tools, plus the prompt contract."""
+"""The MCP facade: the six doc 04 §1 verbs plus memory_confirm, and the
+prompt contract."""
 
 import json
 
@@ -13,10 +14,11 @@ def server(svc):
     return build_server(svc, SAGE_FOR_DANA, DEPLOYS_FLOW)
 
 
-async def test_p3_tool_surface(server):
+async def test_tool_surface(server):
     tools = {t.name for t in await server.list_tools()}
     assert tools == {"memory_remember", "memory_recall", "memory_reinforce",
-                     "memory_status", "memory_promote", "memory_confirm"}
+                     "memory_forget", "memory_status", "memory_promote",
+                     "memory_confirm"}
     prompts = {p.name for p in await server.list_prompts()}
     assert "prompt_contract" in prompts
 
