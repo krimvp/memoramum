@@ -36,7 +36,7 @@ def test_snapshot_covers_the_doc_07_4_families(svc):
         assert set(verdicts) <= {"allow", "stage", "ask", "deny"}
 
     lc = snap["lifecycle"]
-    assert set(lc["tier_population"]) <= {"org", "surface", "container", "subject", "agent"}
+    assert set(lc["tier_population"]) <= {"org", "surface", "container", "subject", "agent", "module"}
     for statuses in lc["tier_population"].values():
         assert set(statuses) <= {"staged", "active", "invariant",
                                  "deprecated", "archived", "tombstoned"}

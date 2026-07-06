@@ -18,7 +18,7 @@ async def test_tool_surface(server):
     tools = {t.name for t in await server.list_tools()}
     assert tools == {"memory_remember", "memory_recall", "memory_reinforce",
                      "memory_forget", "memory_status", "memory_promote",
-                     "memory_confirm"}
+                     "memory_confirm", "memory_observe"}
     prompts = {p.name for p in await server.list_prompts()}
     assert "prompt_contract" in prompts
 

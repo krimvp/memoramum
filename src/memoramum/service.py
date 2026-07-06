@@ -145,6 +145,34 @@ class MemoryService:
             ).fetchone()
             return _plain(row)
 
+    def set_module_paths(
+        self, principal: Principal, *, module_scope_id: str, globs: list[str],
+    ) -> dict:
+        """Administer the ADR-0010 module-path mapping (org-admin or system):
+        replace the glob set for a module scope. Replace, not merge — the
+        stored set is the whole boundary. Operational config an admin owns
+        (doc 07): a stale glob quietly routes new paths to the project scope,
+        visible in staged-triage."""
+        with self.pool.connection() as conn:
+            cur = conn.cursor()
+            if not (principal.kind == "system" or self._is_org_admin(cur, principal)):
+                raise AccessDenied(
+                    "module-path administration is an org-admin action (ADR-0010)"
+                )
+            scope = scopes.get_scope(cur, module_scope_id)
+            if scope is None:
+                raise NotFound(f"scope {module_scope_id!r} not found")
+            if scope["family"] != "module":
+                raise ValueError(f"{module_scope_id} is not a module scope")
+            cur.execute("DELETE FROM module_paths WHERE module_scope_id=%s", (module_scope_id,))
+            for glob in globs:
+                cur.execute(
+                    "INSERT INTO module_paths (module_scope_id, glob) VALUES (%s,%s)"
+                    " ON CONFLICT DO NOTHING",
+                    (module_scope_id, glob),
+                )
+            return {"module_scope_id": module_scope_id, "globs": list(globs)}
+
     # ---------- platform: episodes ----------
 
     def register_episode(
@@ -156,6 +184,14 @@ class MemoryService:
             cur = conn.cursor()
             if scopes.get_scope(cur, scope_id) is None:
                 raise NotFound(f"scope {scope_id!r} not found")
+            # Dev-time episode registration (memory_observe, ADR-0012) is
+            # self-reported: an agent may only register episodes in a scope it
+            # may write to. Platform ingestion (system) and user directives
+            # (user) keep their existing reach.
+            if principal.kind == "agent" and not scopes.writable(cur, principal, scope_id):
+                raise AccessDenied(
+                    f"{principal.actor} is not enrolled as a writer in {scope_id}"
+                )
             row = cur.execute(
                 "INSERT INTO episodes (scope_id, source_kind, external_ref, content, author, occurred_at)"
                 " VALUES (%s,%s,%s,%s,%s,%s) RETURNING *",
@@ -219,8 +255,13 @@ class MemoryService:
             # Routing (doc 05 §1): policy, not the agent, decides where the
             # write lands; the requested scope is only ever narrowed.
             target_scope = flow.container
-            if verdict.decision != "deny" and verdict.route_scope == "subject":
-                target_scope = self._route_subject(cur, subjects) or target_scope
+            if verdict.decision != "deny":
+                if verdict.route_scope == "subject":
+                    target_scope = self._route_subject(cur, subjects) or target_scope
+                elif verdict.route_scope == "module":
+                    target_scope = self._route_module(cur, flow) or target_scope
+                elif verdict.route_scope == "agent":
+                    target_scope = self._route_agent(cur, principal) or target_scope
 
             # Enrollment gate on the routed target — an agent not enrolled
             # as writer never gets a policy 'allow'. Denials are events.
@@ -394,6 +435,16 @@ class MemoryService:
                     "classifier": self.analyzer.version}
         if pii_actions:
             activity["pii_actions"] = pii_actions
+        if flow.touched_paths:
+            # The module hint (issue #15): which module scopes this write's
+            # source paths touch, so staged-triage and promotion tooling can
+            # propose mr→module promotion once the candidate earns
+            # reinforcement (doc 03 §4). A hint, not a router — the candidate
+            # itself stayed in its source scope.
+            project = self._flow_project(cur, flow)
+            touched = scopes.modules_touched(cur, project, flow.touched_paths) if project else []
+            if touched:
+                activity["modules_touched"] = touched
         cur.execute(
             "INSERT INTO memory_provenance (memory_id, origin_kind, responsible_agent,"
             " on_behalf_of, activity, justification)"
@@ -782,6 +833,7 @@ class MemoryService:
                 item = _plain(_public_memory(r))
                 item["contradicts"] = _plain(r["contradicted_id"])
                 item["provenance"] = self._provenance_hint(cur, str(r["id"]), r["scope_id"])
+                item["modules_touched"] = self._modules_hint(cur, str(r["id"]))
                 out.append(item)
             return out
 
@@ -1596,6 +1648,10 @@ class MemoryService:
                 layers.append(policy.layer_from_document(row["document"], row["version"]))
             elif layer_name == "org":
                 layers.append(policy.BUILTIN_ORG_LAYER)
+            elif layer_name == "surface" and applies_to == "surface:ide":
+                # The dev-time agent surface ships a built-in default when no
+                # surface policy is stored (ADR-0012/0013), like the org layer.
+                layers.append(policy.BUILTIN_IDE_SURFACE_LAYER)
         return layers
 
     def _layers_for_write(self, cur, **kw) -> list[policy.PolicyLayer]:
@@ -1656,10 +1712,47 @@ class MemoryService:
                 )
         return sid
 
+    def _flow_project(self, cur, flow: Flow) -> str | None:
+        """The flow's project scope: named explicitly (dev-time flows) or
+        detected structurally from the container (ADR-0009/0010)."""
+        return flow.project or scopes.flow_project_scope(cur, flow.container)
+
+    def _route_module(self, cur, flow: Flow) -> str | None:
+        """route: {scope: module} (ADR-0013): dev-time codebase conventions
+        land in the touched module scope. Exactly one touched module → that
+        scope; anything else (ambiguous or no match) falls open to the flow's
+        project scope when resolvable, else None (the write stays in its
+        source scope). Fail-open to broader-but-correct, never to a wrong
+        module (ADR-0010)."""
+        project = self._flow_project(cur, flow)
+        modules = scopes.modules_touched(cur, project, flow.touched_paths) if project else []
+        if len(modules) == 1:
+            return modules[0]
+        return project
+
+    def _route_agent(self, cur, principal: Principal) -> str | None:
+        """route: {scope: agent} (ADR-0013): personal dev-time task tactics
+        stay in the writing agent's own scope. Provisioned on first routing
+        like subject scopes; enrollment still gates the write (the agent owns
+        its own scope, scopes.writable)."""
+        if principal.kind != "agent":
+            return None
+        sid = principal.actor
+        if scopes.get_scope(cur, sid) is None:
+            scopes.create_scope(cur, scope_id=sid, family="agent",
+                                parent_scope_id=self.settings.org_scope_id)
+        return sid
+
     def _crossing(self, cur, source: dict, target: dict) -> str:
         """Classify a promotion for the doc 05 §3 gate table."""
         if target["family"] == "subject":
             return "subject"
+        if target["family"] == "module":
+            return "module"  # mr / dev-session → module (ADR-0011)
+        if source["family"] == "module" and any(
+            s["id"] == target["id"] for s in scopes.ancestors(cur, source["id"])
+        ):
+            return "module_project"  # module → its ancestor project (ADR-0011)
         if any(s["id"] == source["id"] for s in scopes.ancestors(cur, target["id"])):
             return "narrowing"  # broader → narrower: the target sits under the source
         return "shared"
@@ -1762,6 +1855,17 @@ class MemoryService:
             raise AccessDenied(
                 f"confirmers are members of {scope} (doc 05 §3); {human} is not"
             )
+        if kind in ("module_owner", "maintainer"):
+            # mr → module asks the module_owner tuple on the module scope;
+            # module → project asks the maintainer tuple on the project scope
+            # (ADR-0011). Both are the target scope of the pending promotion —
+            # a table lookup like every other ReBAC question.
+            target = pending["target_scope_id"]
+            if scopes._has_relation(cur, [target], kind, human):
+                return
+            raise AccessDenied(
+                f"only a {kind} of {target} confirms this crossing (ADR-0011); {human} is not"
+            )
         # subject: dana confirms what is recorded about dana in shared view.
         target = pending["target_scope_id"]
         owner = cur.execute(
@@ -1844,6 +1948,11 @@ class MemoryService:
         ).fetchall()
         if any(e["source_kind"] in UNTRUSTED_SOURCE_KINDS for e in eps):
             return 0.25
+        if any(e["source_kind"] == "dev_observation" for e in eps):
+            # Self-reported from a personal dev session (ADR-0012): no
+            # platform-side subscriber verified it, so a modest penalty below
+            # a platform-attributed scope-member author (0.6).
+            return 0.45
         if any(e["author"] is None
                or not scopes.user_can_see(cur, e["author"], e["scope_id"]) for e in eps):
             return 0.35
@@ -2066,6 +2175,17 @@ class MemoryService:
         if scope and scope["external_ref"] and scope["external_ref"].get("name"):
             return scope["external_ref"]["name"]
         return scope_id
+
+    def _modules_hint(self, cur, memory_id: str) -> list[str]:
+        """The module scopes this staged candidate's source paths touched
+        (issue #15), recorded at write time in provenance activity — the hint
+        the staged-triage UI shows to propose mr→module promotion."""
+        prov = cur.execute(
+            "SELECT activity FROM memory_provenance WHERE memory_id=%s", (memory_id,)
+        ).fetchone()
+        if prov and prov["activity"]:
+            return list(prov["activity"].get("modules_touched") or [])
+        return []
 
     def _provenance_hint(self, cur, memory_id: str, scope_id: str) -> str:
         """One line an agent can weigh and cite: origin, place, date, author,

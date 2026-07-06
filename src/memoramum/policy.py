@@ -29,8 +29,8 @@ _STRICTNESS = {"deny": 3, "ask": 2, "stage": 1, "allow": 0}
 LAYERS = ("org", "surface", "agent", "user_pref")
 SENSITIVITIES = ("public", "internal", "confidential", "restricted")
 _SENSITIVITY_RANK = {s: i for i, s in enumerate(SENSITIVITIES)}
-ROUTES = ("source", "subject")
-CONFIRMERS = ("flow_user", "scope_member", "subject")
+ROUTES = ("source", "subject", "module", "agent")
+CONFIRMERS = ("flow_user", "scope_member", "subject", "module_owner", "maintainer")
 
 
 class PolicyError(ValueError):
@@ -187,6 +187,36 @@ BUILTIN_ORG_LAYER = PolicyLayer(
 )
 
 
+# The shipped default for the dev-time agent surface (ADR-0012/0013): used
+# when flow.surface == 'ide' and no surface policy is stored, mirroring the
+# BUILTIN_ORG_LAYER fallback. Codebase conventions route to the touched
+# module scope (fallback project); personal task tactics stay in the writing
+# agent's own scope. Both stage — reinforcement decides promotion (doc 03 §4).
+BUILTIN_IDE_SURFACE_LAYER = PolicyLayer(
+    name="surface",
+    version="builtin-ide-1",
+    applies_to="surface:ide",
+    strategies=(
+        Strategy(
+            name="codebase-conventions",
+            decision="stage",
+            categories=("codebase_convention",),
+            route_scope="module",
+            reason="dev-time codebase conventions route to the touched module scope,"
+                   " staged for reinforcement (ADR-0013)",
+        ),
+        Strategy(
+            name="task-tactics",
+            decision="stage",
+            categories=("task_tactic",),
+            route_scope="agent",
+            reason="personal dev-time task tactics stay in the writing agent's"
+                   " own scope (ADR-0013)",
+        ),
+    ),
+)
+
+
 # ---------- document parsing (doc 05 §1 shape; §5: YAML in, canonical JSON out) ----------
 
 _STRATEGY_KEYS = {"name", "kinds", "categories", "origin_kinds", "subjects", "surfaces",
@@ -229,7 +259,7 @@ def parse_document(document) -> dict:
         if isinstance(route, str):
             route = {"scope": route}
         if route.get("scope", "source") not in ROUTES:
-            raise PolicyError(f"unknown route {route!r} (expected scope: source|subject)")
+            raise PolicyError(f"unknown route {route!r} (expected scope: source|subject|module|agent)")
         if raw.get("subjects") not in (None, "participants"):
             raise PolicyError("strategy 'subjects' only supports 'participants'")
         floor = raw.get("sensitivity_floor")
@@ -249,12 +279,17 @@ def parse_document(document) -> dict:
     promotion = doc.get("promotion") or {}
     for key, allowed in (("to_shared_scope", ("ask", "deny")),
                          ("to_subject_scope", ("ask", "deny")),
+                         ("to_module_scope", ("ask", "deny")),
+                         ("to_project_scope", ("ask", "deny")),
                          ("from_private_scope", ("deny",))):
         if key in promotion and promotion[key] not in allowed:
             raise PolicyError(f"promotion.{key} can only tighten the default: {allowed}")
     confirmers = promotion.get("confirmers", [])
-    if not set(confirmers) <= {"scope_member", "subject"}:
-        raise PolicyError("promotion.confirmers supports 'scope_member' and 'subject'")
+    if not set(confirmers) <= {"scope_member", "subject", "module_owner", "maintainer"}:
+        raise PolicyError(
+            "promotion.confirmers supports 'scope_member', 'subject',"
+            " 'module_owner' and 'maintainer'"
+        )
     if promotion:
         canonical["promotion"] = promotion
 
@@ -384,8 +419,10 @@ def promotion_gate(
     layers: list[PolicyLayer], *, crossing: str, source_trust_class: str,
 ) -> PromotionGate:
     """The doc 05 §3 defaults, tightened (never loosened) by the layers'
-    `promotion:` sections. `crossing` is 'narrowing' (target is a
-    descendant of the source), 'subject' (target is a subject scope) or
+    `promotion:` sections. `crossing` is 'narrowing' (target is a descendant
+    of the source), 'subject' (target is a subject scope), 'module' (target
+    is a module scope: mr/dev-session → module, ADR-0011), 'module_project'
+    (source is a module scope, target its ancestor project, ADR-0011) or
     'shared' (any other move — up the tree or sideways)."""
     if source_trust_class == "private":
         return PromotionGate(
@@ -402,19 +439,21 @@ def promotion_gate(
             "allow", "org/promotion-narrowing",
             "broader → narrower needs no ceremony (doc 01 §3.2)",
         )
-    key = "to_subject_scope" if crossing == "subject" else "to_shared_scope"
+    key = {"subject": "to_subject_scope", "module": "to_module_scope",
+           "module_project": "to_project_scope"}.get(crossing, "to_shared_scope")
     decision, rule_id = "ask", f"org/promotion-{crossing}-default"
-    reason = (
-        "container → subject crossings ask the subject (doc 05 §3)"
-        if crossing == "subject"
-        else "crossing into a shared scope asks a member of the source scope (doc 05 §3)"
-    )
+    reason = {
+        "subject": "container → subject crossings ask the subject (doc 05 §3)",
+        "module": "mr → module crossings ask the module owner (ADR-0011)",
+        "module_project": "module → project crossings ask a repo maintainer (ADR-0011)",
+    }.get(crossing, "crossing into a shared scope asks a member of the source scope (doc 05 §3)")
     for layer in layers:
         tightened = stricter(decision, layer.promotion.get(key, decision))
         if tightened != decision:
             decision, rule_id = tightened, f"{layer.name}/promotion-{key}@{layer.version}"
             reason = f"promotion.{key} tightened to {tightened} by the {layer.name} layer"
-    confirmer = "subject" if crossing == "subject" else "scope_member"
+    confirmer = {"subject": "subject", "module": "module_owner",
+                 "module_project": "maintainer"}.get(crossing, "scope_member")
     return PromotionGate(decision, rule_id, reason, confirmer if decision == "ask" else None)
 
 

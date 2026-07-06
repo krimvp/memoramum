@@ -8,6 +8,7 @@ membership is checked at read time, never cached at index time.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 from typing import Any
 
@@ -58,6 +59,56 @@ def ancestors(cur, scope_id: str) -> list[dict[str, Any]]:
         """,
         (scope_id,),
     ).fetchall()
+
+
+def flow_project_scope(cur, container_scope_id: str | None) -> str | None:
+    """The project container of a flow (ADR-0009/0010): the nearest container
+    ancestor of `container` whose parent has family 'surface' — structural,
+    never parse scope-id strings. None when no such ancestor exists (e.g. a
+    'devsession' under surface:ide whose chain reaches no project)."""
+    if not container_scope_id:
+        return None
+    anc = ancestors(cur, container_scope_id)
+    by_id = {s["id"]: s for s in anc}
+    for scope in anc:
+        parent = by_id.get(scope["parent_scope_id"])
+        if scope["family"] == "container" and parent is not None and parent["family"] == "surface":
+            return scope["id"]
+    return None
+
+
+def modules_touched(cur, project_scope_id: str, paths) -> list[str]:
+    """The module scopes touched by these repository paths (ADR-0010): match
+    each path against the `module_paths` globs, most-specific (longest glob)
+    wins per path, restricted to module scopes homed under the project scope.
+    Ordered by first appearance, unique. Unmatched paths belong to no module
+    — they fall through to the project scope (already in the chain), never to
+    a wrong module (ADR-0010: fail-open to project)."""
+    paths = [p for p in (paths or []) if p]
+    if not paths or not project_scope_id:
+        return []
+    rows = cur.execute(
+        """
+        WITH RECURSIVE down AS (
+            SELECT id FROM scopes WHERE id = %s
+            UNION ALL
+            SELECT s.id FROM scopes s JOIN down ON s.parent_scope_id = down.id
+        )
+        SELECT mp.module_scope_id, mp.glob FROM module_paths mp
+        JOIN scopes s ON s.id = mp.module_scope_id AND s.family = 'module'
+        WHERE mp.module_scope_id IN (SELECT id FROM down)
+        """,
+        (project_scope_id,),
+    ).fetchall()
+    ordered: list[str] = []
+    for path in paths:
+        best_module, best_len = None, -1
+        for r in rows:
+            if fnmatch.fnmatch(path, r["glob"]) and len(r["glob"]) > best_len:
+                best_module, best_len = r["module_scope_id"], len(r["glob"])
+        if best_module is not None and best_module not in ordered:
+            ordered.append(best_module)
+    return ordered
 
 
 def _has_relation(cur, scope_ids: list[str], relation: str, principal: str) -> bool:
@@ -152,6 +203,7 @@ def resolve_chain(cur, principal: Principal, flow: Flow) -> list[str]:
     where they say they are, and every element is access-checked.
     """
     chain: list[str] = []
+    project_scope_id = flow.project
     if flow.container:
         if get_scope(cur, flow.container) is None:
             raise ScopeError(f"unknown container scope {flow.container!r}")
@@ -159,6 +211,23 @@ def resolve_chain(cur, principal: Principal, flow: Flow) -> list[str]:
             if scope["family"] == "surface":
                 continue  # structural node, not a memory home (doc 01 §3.3 example)
             chain.append(scope["id"])
+        if project_scope_id is None:
+            project_scope_id = flow_project_scope(cur, flow.container)
+
+    # Module scopes touched by this flow (ADR-0009/0010): pulled into the
+    # chain contextually — "modules touched by this MR/session" — exactly the
+    # way participant subject scopes are. They sit immediately after the
+    # container (narrower than the project, so scope_proximity ranks them
+    # just inside it). Dev-time flows (container is a 'devsession', not under
+    # the project) carry the project explicitly and get it slotted in after
+    # the modules — no per-surface copy of project scopes (ADR-0012).
+    if project_scope_id and flow.touched_paths:
+        modules = [m for m in modules_touched(cur, project_scope_id, flow.touched_paths)
+                   if m not in chain]
+        at = 1 if flow.container else 0
+        chain[at:at] = modules
+        if project_scope_id not in chain:
+            chain.insert(at + len(modules), project_scope_id)
 
     # Shared scopes the agent is *directly* enrolled in on another surface
     # (README scenario step 4: "repo → org + relevant shared scopes it is

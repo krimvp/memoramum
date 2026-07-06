@@ -3,7 +3,10 @@
 P4 completes the doc 04 §1 tool surface: the six verbs —
 memory_remember, memory_recall, memory_reinforce, memory_forget,
 memory_promote, memory_status — plus memory_confirm (the closing half of
-every `ask`), and the prompt contract of doc 04 §4 as an MCP prompt.
+every `ask`), and the prompt contract of doc 04 §4 as an MCP prompt. P5
+adds the seventh verb, memory_observe: the dev-time episode-registration
+path for personal agents whose surface has no platform-side subscriber
+(ADR-0012).
 
 One server process serves one session context: the principal pair and the
 flow (surface, container, participants) come from the environment the
@@ -164,6 +167,30 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
 
     @mcp.tool()
     @_degrades
+    def memory_observe(
+        content: str,
+        paths: list[str] | None = None,
+        ref: str | None = None,
+        occurred_at: datetime | None = None,
+    ) -> dict:
+        """Register a dev-time observation as an episode in this session's
+        scope (ADR-0012). No platform-side subscriber exists for a local
+        session, so the client self-reports; these episodes carry a lower
+        trust base than platform-verified sources. `paths` are the files the
+        observation is about — they route codebase conventions to the right
+        module scope. Extraction (not this tool) proposes memories from what
+        you observe; enrollment still gates the write."""
+        external_ref: dict = {"paths": list(paths or [])}
+        if ref:
+            external_ref["ref"] = ref
+        return service.register_episode(
+            principal, scope_id=flow.container, source_kind="dev_observation",
+            external_ref=external_ref, content=content,
+            author=principal.effective_user, occurred_at=occurred_at,
+        )
+
+    @mcp.tool()
+    @_degrades
     def memory_status(
         memory_id: str | None = None,
         subject: str | None = None,
@@ -191,11 +218,16 @@ def main() -> None:
     participants = tuple(
         p.strip() for p in os.environ.get("MEMORAMUM_PARTICIPANTS", "").split(",") if p.strip()
     )
+    touched_paths = tuple(
+        p.strip() for p in os.environ.get("MEMORAMUM_TOUCHED_PATHS", "").split(",") if p.strip()
+    )
     flow = Flow(
         surface=os.environ.get("MEMORAMUM_SURFACE"),
         container=os.environ.get("MEMORAMUM_CONTAINER"),
         participants=participants,
         session_id=os.environ.get("MEMORAMUM_SESSION"),
+        project=os.environ.get("MEMORAMUM_PROJECT") or None,
+        touched_paths=touched_paths,
     )
     service = MemoryService(make_pool(settings.database_url), settings)
     build_server(service, principal, flow).run()

@@ -82,6 +82,11 @@ class RelationRequest(BaseModel):
     remove: bool = False
 
 
+class ModulePathsRequest(BaseModel):
+    module_scope_id: str
+    globs: list[str] = Field(default_factory=list)   # replace semantics (ADR-0010)
+
+
 class ReviewRequest(BaseModel):
     action: str                    # confirm | reject
     note: str = ""
@@ -177,7 +182,7 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
 
     @app.get("/healthz")
     def healthz():
-        return {"ok": True, "phase": "P4"}
+        return {"ok": True, "phase": "P5"}
 
     @app.post("/v1/context-block")
     def context_block(
@@ -258,6 +263,15 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
                      principal: Principal = Depends(principal_from_headers)):
         svc.set_relation(principal, scope_id, body.relation, body.principal, remove=body.remove)
         return {"ok": True}
+
+    # The ADR-0010 module-boundary mapping: repository path globs → module
+    # scope (org-admin/system; replace semantics).
+    @app.post("/v1/module-paths")
+    def set_module_paths(body: ModulePathsRequest,
+                         principal: Principal = Depends(principal_from_headers)):
+        return svc.set_module_paths(
+            principal, module_scope_id=body.module_scope_id, globs=body.globs
+        )
 
     # --- review surface: staged triage & held contradictions (doc 07 §6 P2) ---
 
