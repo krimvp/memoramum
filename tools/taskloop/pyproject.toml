@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taskloop"
+version = "0.1.0"
+description = "Thin agentic loop that drains labeled GitHub issues with parallel headless Claude Code workers"
+requires-python = ">=3.11"
+dependencies = [
+    "claude-agent-sdk>=0.1.0",
+    "anyio>=4.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+taskloop = "taskloop.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["taskloop*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
