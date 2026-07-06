@@ -17,7 +17,7 @@ AS_SYSTEM = {"X-Memoramum-Actor": "system:ingest"}
 
 
 def test_healthz(client):
-    assert client.get("/healthz").json() == {"ok": True, "phase": "P4"}
+    assert client.get("/healthz").json() == {"ok": True, "phase": "P5"}
 
 
 def test_episode_and_context_block_roundtrip(client):

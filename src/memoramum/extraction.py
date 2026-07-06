@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
+from . import scopes
 from .principals import Flow, Principal
 
 
@@ -64,8 +65,13 @@ class MarkerExtractor:
     version = "marker-1"
 
     _MARKER = re.compile(
-        r"(?im)^\s*(?:reminder|note|remember|heads[- ]?up|psa|fyi)[:,]\s*(?P<fact>.+?)\s*$"
+        r"(?im)^\s*(?P<marker>reminder|note|remember|heads[- ]?up|psa|fyi|convention|tactic)[:,]"
+        r"\s*(?P<fact>.+?)\s*$"
     )
+    # Dev-time markers carry their policy category directly (ADR-0013):
+    # 'convention:' → a shared codebase convention, 'tactic:' → a personal
+    # task tactic. The others infer category from content below.
+    _MARKER_CATEGORY = {"convention": "codebase_convention", "tactic": "task_tactic"}
     _CATEGORY_HINTS: tuple[tuple[str, re.Pattern], ...] = (
         ("process", re.compile(r"(?i)\b(deploy|release|pipeline|schedule|process|review)s?\b")),
         ("preference", re.compile(r"(?i)\bprefers?\b")),
@@ -79,6 +85,9 @@ class MarkerExtractor:
                 categories = tuple(
                     c for c, pattern in self._CATEGORY_HINTS if pattern.search(fact)
                 )
+                marker_category = self._MARKER_CATEGORY.get(m.group("marker").lower())
+                if marker_category:
+                    categories = (marker_category, *categories)
                 out.append(
                     ExtractionCandidate(
                         content=fact,
@@ -145,6 +154,7 @@ class ExtractionWorker:
             ).fetchall()
             scope = cur.execute("SELECT * FROM scopes WHERE id=%s", (scope_id,)).fetchone()
             agent = self._responsible_agent(cur, scope_id)
+            project = scopes.flow_project_scope(cur, scope_id)
 
         result: dict = {"episodes": len(episodes), "proposed": []}
         if agent is None:
@@ -156,8 +166,20 @@ class ExtractionWorker:
             participants = tuple(
                 sorted({e["author"] for e in episodes if e["author"] and e["author"].startswith("user:")})
             )
+            # Candidates default to the narrow source scope (route: source);
+            # the paths their source episodes touched are aggregated onto the
+            # flow so the write records a module hint (issue #15). Narrow by
+            # default — reinforcement, not this tag, decides mr→module
+            # promotion (doc 03 §4). The module tag is a hint, not a router.
+            touched: list[str] = []
+            for e in episodes:
+                ref = e["external_ref"] if isinstance(e["external_ref"], dict) else {}
+                for p in ref.get("paths") or []:
+                    if p and p not in touched:
+                        touched.append(p)
             flow = Flow(surface=scope["surface"], container=scope_id,
-                        participants=participants, session_id=f"extraction:{scope_id}")
+                        participants=participants, session_id=f"extraction:{scope_id}",
+                        project=project, touched_paths=tuple(touched))
             for cand in self.extractor.extract(episodes):
                 verdict = self.svc.remember(
                     Principal(agent), flow,

@@ -78,7 +78,7 @@ Two distinct promotions, both explicit, both evented:
   - *explicit confirmation*: a user confirms an `ask` prompt or approves via the review UI.
 
   Default rule (per-category tunable): promote on `(re-observations ≥ 1) OR (useful retrievals ≥ 2) OR explicit confirm`, with a floor of 3 days in staging for `agent_observed` memories from non-member authors.
-- **Scope promotion** (`channel → workspace`, `channel → subject:*`, anything → cross-surface-visible): governed by [doc 05 §3](05-policy.md). Crossing into a shared scope or a subject scope defaults to `ask` (a human confirms); promotions out of `private` trust-class scopes are denied by default. Scope promotion *re-runs the write pipeline* (redaction, sensitivity, policy) against the destination scope — a memory acceptable in `#deploys` may need PII tokenization to sit at workspace level.
+- **Scope promotion** (`channel → workspace`, `channel → subject:*`, anything → cross-surface-visible): governed by [doc 05 §3](05-policy.md). Crossing into a shared scope or a subject scope defaults to `ask` (a human confirms); promotions out of `private` trust-class scopes are denied by default. Scope promotion *re-runs the write pipeline* (redaction, sensitivity, policy) against the destination scope — a memory acceptable in `#deploys` may need PII tokenization to sit at workspace level. Monorepo crossings work the same way: `mr → module` (or dev-session → module) and the stricter `module → project` are governed crossings with their own confirmers ([doc 05 §3](05-policy.md), [ADR-0011](adr/0011-module-promotion-crossings.md)).
 
 ## 5. Aging: decay, staleness, and soft forgetting
 

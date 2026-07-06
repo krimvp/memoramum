@@ -59,7 +59,9 @@ class Flow:
     """Where the call is happening. Agents describe where they are; the
     service decides what that makes visible (doc 04)."""
 
-    surface: str | None = None            # 'slack', 'gitlab'
+    surface: str | None = None            # 'slack', 'gitlab', 'ide'
     container: str | None = None          # scope id of the innermost container, e.g. 'thread/…' or 'channel/C0DEP'
     participants: tuple[str, ...] = field(default_factory=tuple)
     session_id: str | None = None
+    project: str | None = None            # project container scope the session works against — dev-time flows (container is a 'devsession', not an MR) name it explicitly (ADR-0012)
+    touched_paths: tuple[str, ...] = field(default_factory=tuple)   # MR diff paths / dev-session touched files, mapped onto module scopes (ADR-0010)

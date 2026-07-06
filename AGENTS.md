@@ -3,7 +3,7 @@
 ## What this repository is
 
 Memoramum is the design for a standalone memory service for AI agents, plus a **reference
-implementation that follows the design's phased rollout** (doc 07 §6) — currently at **P4**,
+implementation that follows the design's phased rollout** (doc 07 §6) — currently at **P5**,
 the final phase.
 The ~1,300 lines of tightly cross-referenced Markdown remain the **normative** artifact:
 code implements the docs, never the other way around. "Working on this repo" means keeping
@@ -15,7 +15,7 @@ index.html                    self-contained static page: high-level design over
 pyproject.toml, Makefile      Python package + dev entry points (venv/db/migrate/test/api/
                               consolidate/extract)
 docker-compose.yml            dev Postgres 16 + pgvector (ADR-0004 stack)
-src/memoramum/                reference implementation, P4 (ADR-0007):
+src/memoramum/                reference implementation, P5 (ADR-0007):
                               migrations/ = the doc 02 DDL verbatim (plus operational tables);
                               service.py = API core; rest.py / mcp_server.py = the two facades
                               (ADR-0005); scopes.py, events.py, policy.py, retrieval.py =
@@ -24,9 +24,10 @@ src/memoramum/                reference implementation, P4 (ADR-0007):
                               extraction.py = the doc 07 §1 workers; consolidator.py = the
                               full doc 07 §2 job set; erasure.py = the doc 06 §2 pipeline;
                               observability.py = the doc 07 §4 metrics (ADR-0008)
-tests/                        integration tests against real Postgres, incl. the P1–P4 exit
+tests/                        integration tests against real Postgres, incl. the P1–P5 exit
                               criteria of doc 07 §6 (test_worked_scenario.py = the full
-                              6-step scenario across Slack + GitLab)
+                              6-step scenario across Slack + GitLab; test_module_scenario.py
+                              = the P5 module-scope scenario)
 docs/
   01-concepts-and-scopes.md   core nouns; the scope tree; scope chains; principals
   02-data-model.md            reference Postgres DDL: scopes, memories, episodes,

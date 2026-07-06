@@ -153,7 +153,15 @@ class Consolidator:
         different chains, e.g. a promotion into a scope that already knew
         the fact. Candidate generation is a per-scope pairwise pass in the
         reference implementation (embedding-neighborhood pre-filtering is
-        an optimization, not a semantic)."""
+        an optimization, not a semantic).
+
+        The per-scope boundary is load-bearing under the module topology
+        (ADR-0009): sibling module scopes (`module:proj/a`, `module:proj/b`)
+        never enter the same candidate group, so genuinely contradicting
+        conventions in two modules are never merged or deduped against each
+        other. Reflection is likewise per scope, and contradiction review is
+        queue-driven from write-time holds within a single scope chain — no
+        job compares across sibling scopes."""
         merged: list[dict] = []
         with self.svc.pool.connection() as conn:
             cur = conn.cursor()
