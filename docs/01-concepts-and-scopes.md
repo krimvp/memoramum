@@ -40,7 +40,7 @@ A **scope** is the visibility container a memory lives in. The scope model is th
 
 ### 3.1 The scope tree
 
-Scopes form a forest of three families under a single org root:
+Scopes form a forest of four families under a single org root:
 
 ```
 org:acme
@@ -51,6 +51,9 @@ org:acme
 ├── surface:gitlab
 │   └── container:project/platform-api     (repo)
 │       └── container:mr/482               (one MR)
+├── surface:ide                            (personal dev-time agents — ADR-0012)
+│   └── container:devsession/9f3a          (one local session — private)
+├── module:platform-api/payments          (module conventions — parallel family, ADR-0009)
 ├── subject:user/dana                      (about dana — cross-surface)
 ├── subject:team/atlas                     (about a team — cross-surface)
 └── agent:sage                             (Sage's private working knowledge)
@@ -59,6 +62,8 @@ org:acme
 - **Container scopes** mirror the natural containers of each surface. They nest: a memory in `channel/C0DEP` is *narrower* than one in `workspace/T024B`. The tree is extensible — a new surface adds a subtree, nothing else changes.
 - **Subject scopes** hold memories *about* a person or team, independent of where they were learned. They are what lets Sage and Marge share "dana prefers small MRs" without either surface owning that fact. Subject scopes are the GDPR-sensitive family: everything in `subject:user/dana` is enumerable for a data-subject request ([doc 06](06-audit-privacy-security.md)).
 - **Agent scopes** are an agent's private notebook: task tactics, self-observations, working state. Never readable by other agents by default.
+- **Module scopes** are a parallel family for monorepo-module conventions: `module:<project>/<path>` (e.g. `module:platform-api/payments`), with `parent_scope_id` the project container, so project enrollment and membership govern them by the same subtree walk. They hold conventions about one module independent of any single MR, and — like subject scopes — are pulled into a read's scope chain *contextually*: by the paths a flow touches (§3.3), not by where it runs. See [ADR-0009](adr/0009-module-scope-family.md).
+- **`surface:ide`** is the personal dev-time surface (IDE- or CLI-hosted agents), with per-session `container:devsession/<id>` scopes at `trust_class=private` — a developer's local session is theirs. Unlike the platform surfaces, its episodes are client-registered rather than platform-ingested ([doc 04 §1](04-agent-interface.md), [ADR-0012](adr/0012-dev-time-agent-surface.md)).
 
 Scope IDs are opaque strings with the `family:qualifier` shape shown above; the hierarchy lives in a `parent_scope_id` relation, not in string parsing ([doc 02 §1](02-data-model.md)).
 
@@ -88,9 +93,11 @@ chain = [ thread/1709…,            # current thread
 Example — Marge reviewing MR !482 in `platform-api`:
 
 ```
-chain = [ mr/482, project/platform-api, org:acme,
+chain = [ mr/482, module:platform-api/payments, project/platform-api, org:acme,
           subject:user/<author>, agent:marge ]
 ```
+
+Two selectors pull parallel-family scopes into a chain contextually: **participants** add their `subject:*` scopes (policy-gated), and the **paths a flow touches** add the `module:*` scopes those paths map to — resolved from the MR diff (or a dev-session's touched files) through the `module_paths` glob mapping ([ADR-0010](adr/0010-module-boundary-detection.md)), inserted narrower-than-project so a module's own convention outranks the repo-wide default. Paths that match no glob map to no module and fall back to the project scope already in the chain. One mechanism, two selectors — no new chain machinery.
 
 Marge's chain contains **no Slack scopes**. The only way the Tuesday-deploys memory reaches Marge is that it was *promoted* to a scope both surfaces share (`org:acme`, or a shared team scope) — which is exactly what step 3 of the [worked scenario](../README.md#the-worked-scenario) does. Cross-surface sharing is therefore not a special mechanism; it falls out of scope placement.
 

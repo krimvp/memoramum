@@ -11,7 +11,7 @@ Four core tables: `scopes`, `episodes`, `memories` (+ `memory_provenance`), `mem
 ```sql
 CREATE TABLE scopes (
     id              text PRIMARY KEY,          -- e.g. 'channel/C0DEP', 'subject:user/dana'
-    family          text NOT NULL CHECK (family IN ('container','subject','agent','org','surface')),
+    family          text NOT NULL CHECK (family IN ('container','subject','agent','org','surface','module')),
     parent_scope_id text REFERENCES scopes(id),-- tree lives here, not in id parsing
     surface         text,                      -- 'slack', 'gitlab', NULL for cross-surface families
     external_ref    jsonb,                     -- surface-native ids: {"team":"T024B","channel":"C0DEP"}
@@ -23,6 +23,7 @@ CREATE TABLE scopes (
 
 - `trust_class` encodes the isolation ordering of [doc 01 §3.2](01-concepts-and-scopes.md): policy defaults key off it (nothing auto-promotes out of `private`; `shared_external` scopes get stricter write policy).
 - Scope *membership* (which users are in a channel) is **not** stored here — it is resolved live against the surface or a synced relation table ([doc 05 §4](05-policy.md)), because the source-visibility invariant requires membership checks at retrieval time, not at index time.
+- The `module` family holds monorepo-module conventions ([doc 01 §3.1](01-concepts-and-scopes.md), [ADR-0009](adr/0009-module-scope-family.md)): `parent_scope_id` is the project container, so access review stays a subtree walk. Which modules a flow touches is resolved from file paths through an operational **`module_paths`** table (`module_scope_id`, `glob`; most-specific match wins), admin-maintained and consulted at both write-time tagging and read-time chain inclusion ([ADR-0010](adr/0010-module-boundary-detection.md)). Unmatched paths belong to no module and fall back to the project scope.
 
 ## 2. Memories
 

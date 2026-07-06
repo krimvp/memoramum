@@ -46,6 +46,17 @@ learning:
       route: { scope: subject }  # routes to subject:user/<id>
       decision: stage
       ttl: 365d
+    - name: codebase-conventions # dev-time observations about a module (ADR-0013)
+      kinds: [semantic, procedural]
+      categories: [codebase_convention]
+      origin_kinds: [agent_observed, llm_inferred]
+      route: { scope: module }   # touched module scope; fallback project (ADR-0009/0010)
+      decision: stage
+    - name: task-tactics         # an agent's own working tricks stay private (ADR-0013)
+      kinds: [semantic, procedural]
+      categories: [task_tactic]
+      route: { scope: agent }    # the writing agent's own agent:* notebook
+      decision: stage
     - name: sensitive-personal
       categories: [health, beliefs, relationships, location_history]
       decision: ask              # never silent, regardless of origin
@@ -59,6 +70,8 @@ learning:
 promotion:                       # scope-promotion rules (doc 03 §4)
   to_shared_scope: ask           # channel -> workspace/org, or -> subject:*
   from_private_scope: deny       # nothing leaves a DM/private channel automatically
+  to_module_scope: ask           # mr/dev-session -> module (confirmer: module_owner; ADR-0011)
+  to_project_scope: ask          # module -> project, stricter (confirmer: maintainer; ADR-0011)
   confirmers: [scope_member]     # who may confirm: any member of the source scope
 
 retention:
@@ -74,7 +87,7 @@ read:
 Semantics:
 
 - **Strategies are the allowlist.** A candidate write is matched against strategies top-down (within a layer); first match wins *within the layer*, then layers combine by strictness (§2). No match anywhere → `deny` (principle 1). This is the Bedrock insight: *what gets learned is declarative configuration, not emergent behavior.*
-- **`route`** decouples "what the agent asked" from "where it lands": policy, not the agent, decides that preference-facts go to subject scopes. The agent's requested scope can only be narrowed by routing, never broadened.
+- **`route`** decouples "what the agent asked" from "where it lands": policy, not the agent, decides that preference-facts go to subject scopes. Route targets are `source` (the source episode's scope, the default), `subject`, `module` (the touched module scope, fallback project — [ADR-0009](adr/0009-module-scope-family.md)/[ADR-0013](adr/0013-dev-time-routing-defaults.md)), and `agent` (the writing agent's private scope). The agent's requested scope can only be narrowed by routing, never broadened — with one named exception: dev-time `codebase_convention` observations route *outward* from the private `devsession` container to the touched `module` scope, the deliberate sharing carve-out of [ADR-0013](adr/0013-dev-time-routing-defaults.md).
 - **Categories** are the vocabulary shared with `memories.categories` — assigned at extraction by the classifier ([doc 06 §4](06-audit-privacy-security.md)), matched by policy. The org layer owns the category taxonomy.
 
 ## 2. Evaluation
@@ -101,11 +114,13 @@ Scope promotion ([doc 03 §4](03-lifecycle.md)) is evaluated as a *write into th
 |---|---|
 | narrower → broader within a surface (channel → workspace) | `ask` (confirmer: member of source scope) |
 | container → subject scope (about-a-person) | `ask` (confirmer: **the subject** — dana confirms what is recorded about dana in shared view) |
+| `mr → module` (or dev-session → module) | `ask` (confirmer: **`module_owner`** — the module-owner relation tuple on the destination module scope) |
+| `module → project` | `ask` (confirmer: **`maintainer`** on the project scope — stricter, a repo-wide assertion needs a repo-wide steward) |
 | anything out of `trust_class=private` | `deny` (org floor; requires org-admin override) |
 | anything out of `trust_class=shared_external` | `deny` by default |
 | broader → narrower | `allow` |
 
-The confirmation itself is an event (`CONFIRM`, actor = the human), and the promoted memory's provenance `activity` records the `policy_decision_id` — the full chain "who allowed this to be shared and under which rule" is reconstructible.
+The two monorepo crossings and their tuple-based confirmers are recorded in [ADR-0011](adr/0011-module-promotion-crossings.md); policy documents may tighten (never loosen) them via the `to_module_scope` / `to_project_scope` keys (§1). The confirmation itself is an event (`CONFIRM`, actor = the human), and the promoted memory's provenance `activity` records the `policy_decision_id` — the full chain "who allowed this to be shared and under which rule" is reconstructible.
 
 ## 4. Access policy (reads & enrollment)
 
@@ -123,6 +138,8 @@ scope_relations(scope_id, relation, principal)
   ('channel/C0DEP',   'reader_agent',  'agent:sage')
   ('channel/C0DEP',   'writer_agent',  'agent:sage')
   ('subject:user/dana','owner',        'user:dana')
+  ('module:platform-api/payments','module_owner','user:li')   -- confirms mr -> module promotions (ADR-0011)
+  ('project/platform-api','maintainer','user:dana')           -- confirms module -> project (repo-wide)
 ```
 
 Read permission for a `(agent, on_behalf_of user)` pair on scope S:

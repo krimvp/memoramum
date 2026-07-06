@@ -7,13 +7,13 @@ The service exposes two facades over one API core ([ADR-0005](adr/0005-standalon
 - an **MCP server** — the primary agent-facing surface; tools below are MCP tool definitions;
 - a **REST/gRPC API** — for platform code (session bootstrapping, review UIs, admin, audit queries).
 
-Every call is authenticated as a principal pair (`agent`, optional `on_behalf_of` user) and carries a **flow context** — surface, container, session id — from which the service resolves the scope chain. Agents never name raw scope ids in reads; they describe where they are, the service decides what that makes visible.
+Every call is authenticated as a principal pair (`agent`, optional `on_behalf_of` user) and carries a **flow context** — surface, container, session id — from which the service resolves the scope chain. For dev-time flows (`surface:ide`) the context also names the project it works against and the paths it touched, which the service maps onto the *existing* `project/*` and `module:*` scopes ([ADR-0012](adr/0012-dev-time-agent-surface.md)). Agents never name raw scope ids in reads; they describe where they are, the service decides what that makes visible.
 
 ---
 
 ## 1. Tool surface (MCP)
 
-Six tools. Deliberately few: every agent-facing memory system that works (Letta, MemGPT, Claude's memory tool) keeps the verb set small and pushes intelligence into descriptions and prompts.
+Seven tools. Deliberately few: every agent-facing memory system that works (Letta, MemGPT, Claude's memory tool) keeps the verb set small and pushes intelligence into descriptions and prompts.
 
 ### `memory_recall`
 
@@ -85,6 +85,17 @@ Scope promotion. Almost always returns `ask` ([doc 05 §3](05-policy.md)). The o
 ```
 
 Read-only introspection: lifecycle state, provenance summary, event history digest. Powers in-chat transparency ("what do you know about me?" must be answerable *in the surface*, not only in an admin UI).
+
+### `memory_observe`
+
+```jsonc
+{ "content": "payments/ stores money as integer cents — never floats",
+  "paths": ["payments/ledger.py", "payments/models.py"],   // files the observation is about
+  "ref": null,                                             // optional deep-link back to the session
+  "occurred_at": null }                                    // when observed; defaults to now
+```
+
+Dev-time episode registration ([ADR-0012](adr/0012-dev-time-agent-surface.md)): the personal `surface:ide` client has no platform-side subscriber, so it registers its own episodes rather than relying on ingestion (§5's `POST /v1/episodes` is platform-only). The episode is `source_kind=dev_observation`, author = the on-behalf-of developer, at a **lower trust base** than platform-verified sources — usable only by agents enrolled as writers on the flow's `devsession/<id>` container. It still traverses the full write pipeline (PII, policy, staged-by-default), and the touched `paths` drive module-scope routing and chain inclusion ([ADR-0010](adr/0010-module-boundary-detection.md), [ADR-0013](adr/0013-dev-time-routing-defaults.md)).
 
 ## 2. Read paths
 
@@ -189,6 +200,7 @@ The contract is persuasive; the *enforcement* is server-side policy ([doc 05](05
 | `GET /v1/review/pending` / `POST /v1/review/pending/{id}` | open `ask` confirmations; approve/decline by the confirmer ([doc 05 §3](05-policy.md)) |
 | `GET /v1/policies` / `POST /v1/policies` | versioned policy documents, YAML in / canonical JSON out ([doc 05 §5](05-policy.md)) |
 | `POST /v1/policies/simulate` | simulation mode: evaluate a proposed policy against recent decisions ([doc 05 §5](05-policy.md)) |
+| `POST /v1/module-paths` | admin: set the path-glob → module-scope mapping ([ADR-0010](adr/0010-module-boundary-detection.md)) |
 | `POST /v1/memories/{id}/forget` | user/review-UI forget ([doc 03 §6](03-lifecycle.md); agents use the `memory_forget` tool) |
 | `POST /v1/erasure-requests` / `GET /v1/erasure-requests/{id}` | GDPR pipeline; completed requests carry the signed attestation ([doc 06 §2](06-audit-privacy-security.md)) |
 | `POST /v1/quarantine` | provenance-based bulk revoke ([doc 06 §3](06-audit-privacy-security.md)) |

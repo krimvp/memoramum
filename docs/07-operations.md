@@ -24,6 +24,7 @@ The runtime shape of the service: the background machinery ("memory itself shoul
 ```
 
 - **Ingestion** subscribes to surface event streams and registers episodes (refs always, verbatim by policy). It also feeds the **membership sync** used by retrieval-time access checks ([doc 05 §4](05-policy.md)).
+- **Dev-time registration** — the personal `surface:ide` ([ADR-0012](adr/0012-dev-time-agent-surface.md)) has no platform-side subscriber; its MCP client pushes episodes directly via `memory_observe` ([doc 04 §1](04-agent-interface.md)) rather than through webhook-subscribed ingestion. Same write pipeline, lower `dev_observation` trust base.
 - **API core** is the single enforcement point: both facades route through it; nothing reaches Postgres except through it (plus RLS as defense-in-depth).
 - **Extraction workers** implement `agent_observed` learning: debounced background reflection over recent episodes per scope (the LangMem `ReflectionExecutor` pattern — accumulate, cancel-and-reschedule on new activity, run at conversation-lull; default debounce 30 min, cap 4 h). Extraction proposes candidates through the same write pipeline as any agent — policy applies identically.
 - **Consolidator** — §2.
@@ -96,6 +97,7 @@ Each phase is shippable and useful on its own; nothing later requires reworking 
 | **P2 — Lifecycle** | Staged tier + `llm_inferred` hot-path writes; reinforcement + decay + sweeps; supersession & contradiction handling; review UI for staged triage. | Staged→active promotions happening organically; contradiction demo (scenario step 5). |
 | **P3 — Policy & promotion** | Full learning-policy engine (layers, strategies, `ask` flows); scope promotion with confirmations; PII pipeline; sensitivity ceilings & trust floors; user preference layer. | Scenario steps 3–4 across two scopes; policy simulation mode working. |
 | **P4 — Background learning & cross-surface** | Extraction workers (`agent_observed`); consolidator full job set; second surface (MR-review agent) + subject scopes in anger; quarantine tooling; erasure pipeline hardened (attestation). | The full worked scenario, verbatim, across Slack + GitLab. |
+| **P5 — Dev-time & module scopes** | `module` scope family + path-glob boundary config (`module_paths`); `mr → module` / `module → project` promotions; personal dev-time surface (`surface:ide`) with client-registered episodes (`memory_observe`); dev-time routing defaults. | The module-scope scenario: dev-time observation → shared scope; MR candidates across modules; `mr → module` promotion via `module_owner`; sibling-module contradiction isolation; a later MR surfacing only its own module's convention — runs as `tests/test_module_scenario.py`. |
 
 Deliberately **not** in scope until a trigger fires: knowledge-graph retrieval, multi-tenancy, cross-org sharing, agent-to-agent memory exchange outside shared scopes.
 
