@@ -4,8 +4,10 @@ How agents actually use the system: the tool surface, the two read paths, the wr
 
 The service exposes two facades over one API core ([ADR-0005](adr/0005-standalone-service-mcp.md)):
 
-- an **MCP server** — the primary agent-facing surface; tools below are MCP tool definitions;
-- a **REST/gRPC API** — for platform code (session bootstrapping, review UIs, admin, audit queries).
+- an **MCP server** — the *only* agent-facing surface; tools below are MCP tool definitions;
+- a **REST/gRPC API** — for platform code (session bootstrapping, review UIs, admin, audit queries), never for agents.
+
+Agents reach the MCP facade one of two ways ([ADR-0015](adr/0015-remote-mcp-streamable-http.md)): **launched** — the surface integration spawns a per-session stdio server with the principal pair and flow in its environment — or **connected** — the harness speaks streamable HTTP to the central deployment's endpoint, authenticating with the same principal-bound bearer tokens as REST ([ADR-0014](adr/0014-bearer-token-rest-auth.md)) and asserting `on_behalf_of` plus the flow in per-request `X-Memoramum-*` headers, the same trust the launcher's environment already carries. Either way no agent holds store credentials, and everything an agent can do to memory is one of the seven tools below.
 
 Every call is authenticated as a principal pair (`agent`, optional `on_behalf_of` user) and carries a **flow context** — surface, container, session id — from which the service resolves the scope chain. For dev-time flows (`surface:ide`) the context also names the project it works against and the paths it touched, which the service maps onto the *existing* `project/*` and `module:*` scopes ([ADR-0012](adr/0012-dev-time-agent-surface.md)). Agents never name raw scope ids in reads; they describe where they are, the service decides what that makes visible.
 
