@@ -13,7 +13,7 @@ the docs mutually consistent *and* keeping `src/` an exact implementation of the
 README.md                     entry point: pitch, worked scenario, doc map, GLOSSARY (normative)
 index.html                    self-contained static page: high-level design overview
 pyproject.toml, Makefile      Python package + dev entry points (venv/db/migrate/test/api/
-                              consolidate/extract)
+                              mcp/consolidate/extract)
 docker-compose.yml            dev Postgres 16 + pgvector (ADR-0004 stack)
 src/memoramum/                reference implementation, P5 (ADR-0007):
                               migrations/ = the doc 02 DDL verbatim (plus operational tables);
@@ -34,7 +34,7 @@ docs/
                               provenance, memory_events — the enum source of truth
   03-lifecycle.md             status state machine; bi-temporal validity; reinforcement,
                               decay, promotion, forgetting
-  04-agent-interface.md       MCP tool surface (6 tools); ambient vs deliberate recall;
+  04-agent-interface.md       MCP tool surface (7 tools); ambient vs deliberate recall;
                               retrieval scoring; the agent prompt contract; REST endpoints
   05-policy.md                learning policy (allow/stage/ask/deny), access policy (ReBAC
                               + attribute rules), layered evaluation
@@ -42,7 +42,7 @@ docs/
                               PII pipeline
   07-operations.md            components, consolidator jobs, reference stack, SLOs, rollout
   appendix-prior-art.md       survey of Letta, Mem0, Zep/Graphiti, LangMem, etc.
-  adr/000N-*.md               one-page records of the contested decisions (14 so far)
+  adr/000N-*.md               one-page records of the contested decisions (15 so far)
 ```
 
 Read `README.md` first, then docs in numeric order — each ends with a "Continue with"

@@ -1,4 +1,4 @@
-"""MCP facade (ADR-0005): the primary agent-facing surface.
+"""MCP facade (ADR-0005): the only agent-facing surface.
 
 P4 completes the doc 04 §1 tool surface: the six verbs —
 memory_remember, memory_recall, memory_reinforce, memory_forget,
@@ -8,31 +8,49 @@ adds the seventh verb, memory_observe: the dev-time episode-registration
 path for personal agents whose surface has no platform-side subscriber
 (ADR-0012).
 
-One server process serves one session context: the principal pair and the
-flow (surface, container, participants) come from the environment the
-surface integration launches the server with. Agents therefore never name
-raw scope ids — they describe nothing; the launcher already did
+One tool registry, two transports (ADR-0015):
+
+**stdio** — one server process, one session context: the principal pair
+and the flow (surface, container, participants) come from the environment
+the surface integration launches the server with. Agents therefore never
+name raw scope ids — they describe nothing; the launcher already did
 (doc 04: "the service decides what that makes visible").
 
-    MEMORAMUM_AGENT=agent:sage MEMORAMUM_ON_BEHALF_OF=user:dana \
-    MEMORAMUM_SURFACE=slack MEMORAMUM_CONTAINER=channel/C0DEP \
-    MEMORAMUM_PARTICIPANTS=user:dana,user:li \
+    MEMORAMUM_AGENT=agent:sage MEMORAMUM_ON_BEHALF_OF=user:dana \\
+    MEMORAMUM_SURFACE=slack MEMORAMUM_CONTAINER=channel/C0DEP \\
+    MEMORAMUM_PARTICIPANTS=user:dana,user:li \\
+    memoramum-mcp
+
+**streamable HTTP** — the central deployment's endpoint: harnesses
+connect remotely instead of spawning anything. The bearer token — the
+same principal-bound MEMORAMUM_API_TOKENS as the REST facade
+(ADR-0014) — names the actor; `on_behalf_of` and the flow ride
+per-request `X-Memoramum-*` headers set by the connecting harness, the
+same trust stdio extends to the launcher's environment. Stateless: any
+replica serves any call.
+
+    MEMORAMUM_MCP_TRANSPORT=http MEMORAMUM_MCP_HOST=0.0.0.0 \\
+    MEMORAMUM_API_TOKENS=agent:sage=S3CRET \\
     memoramum-mcp
 """
 
 from __future__ import annotations
 
 import functools
+import json
 import os
+import secrets
 from datetime import datetime
+from typing import Callable
 
 import psycopg
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from psycopg_pool import PoolTimeout
 
-from .config import settings_from_env
+from .config import Settings, settings_from_env
 from .db import make_pool
-from .principals import Flow, Principal
+from .principals import Flow, Principal, PrincipalError
 from .service import MemoryService, PolicyUnavailable
 
 PROMPT_CONTRACT = """\
@@ -65,6 +83,10 @@ my memory right now" — don't guess, and don't claim memory you couldn't
 reach.
 """
 
+# (Principal, Flow) per call: constant in stdio mode, request-derived in
+# HTTP mode.
+Resolver = Callable[[], tuple[Principal, Flow]]
+
 
 def _degrades(fn):
     """Doc 07 §5: a dead store or policy engine yields an explicit
@@ -82,8 +104,8 @@ def _degrades(fn):
     return wrapper
 
 
-def build_server(service: MemoryService, principal: Principal, flow: Flow) -> FastMCP:
-    mcp = FastMCP("memoramum")
+def _register(mcp: FastMCP, service: MemoryService, resolve: Resolver) -> None:
+    """The doc 04 §1 tool surface, transport-independent."""
 
     @mcp.tool()
     @_degrades
@@ -101,6 +123,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         explicit_user_ask only when the user actually asked. The response is
         the policy verdict (allow | stage | ask | deny) — honor it; a deny is
         final for this write."""
+        principal, flow = resolve()
         return service.remember(
             principal, flow, content=content, kind=kind, origin_kind=origin_kind,
             subjects=subjects, categories=categories, justification=justification,
@@ -119,6 +142,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         """Search memory mid-task (deliberate recall). Use before answering
         anything about a person, team, process, or past decision. Each result
         carries a provenance hint — weigh it, and cite it where useful."""
+        principal, flow = resolve()
         return service.recall(
             principal, flow, query=query, kinds=kinds, subjects=subjects,
             include_staged=include_staged, limit=limit,
@@ -131,6 +155,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         and it was right (this is what earns staged memories their active
         status); signal='wrong' when it misled — that lowers confidence and
         queues it for contradiction review, no forget powers needed."""
+        principal, flow = resolve()
         return service.reinforce(principal, flow, memory_id=memory_id, signal=signal, note=note)
 
     @mcp.tool()
@@ -143,6 +168,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         close it with memory_confirm. Use with the user's ask ("forget
         that") to fulfil a user forget — never claim to have forgotten
         unless the tool confirmed it."""
+        principal, flow = resolve()
         return service.forget(principal, flow, memory_id=memory_id, reason=reason, mode=mode)
 
     @mcp.tool()
@@ -152,6 +178,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         subject scope. Almost always returns `ask` — relay the ask_prompt to
         the human verbatim and close it with memory_confirm. The one tool
         where you name a scope; the service validates you may write there."""
+        principal, flow = resolve()
         return service.promote(
             principal, flow, memory_id=memory_id, target_scope=target_scope,
             justification=justification,
@@ -163,6 +190,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         """Close an `ask`: relay the user's answer to a pending question from
         memory_remember or memory_promote. Only report what the user actually
         said — the confirmation is recorded as the human's decision."""
+        principal, _ = resolve()
         return service.confirm_pending(principal, pending_id, approved=approved, note=note)
 
     @mcp.tool()
@@ -180,6 +208,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         observation is about — they route codebase conventions to the right
         module scope. Extraction (not this tool) proposes memories from what
         you observe; enrollment still gates the write."""
+        principal, flow = resolve()
         external_ref: dict = {"paths": list(paths or [])}
         if ref:
             external_ref["ref"] = ref
@@ -200,6 +229,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         provenance, event digest), subject (everything known about a
         principal, e.g. 'user:dana'), or scope (a scope's inventory). This is
         how "what do you know about me?" gets answered in-surface."""
+        principal, _ = resolve()
         return service.status(principal, memory_id=memory_id, subject=subject, scope=scope)
 
     @mcp.prompt()
@@ -207,27 +237,148 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         """The Memoramum prompt contract: when to remember and recall."""
         return PROMPT_CONTRACT
 
+
+def build_server(service: MemoryService, principal: Principal, flow: Flow) -> FastMCP:
+    """The stdio shape: one server, one session context (ADR-0005)."""
+    mcp = FastMCP("memoramum")
+    _register(mcp, service, lambda: (principal, flow))
     return mcp
+
+
+def _split(header: str) -> tuple[str, ...]:
+    return tuple(p.strip() for p in header.split(",") if p.strip())
+
+
+def build_remote_server(service: MemoryService, settings: Settings) -> FastMCP:
+    """The streamable-HTTP shape (ADR-0015): one central endpoint, the
+    principal pair and flow resolved per request. The token-bound actor is
+    stashed on the ASGI scope by _BearerAuthMiddleware; `on_behalf_of` and
+    the flow are caller-asserted headers — the same trust stdio extends to
+    the launcher's environment variables."""
+    if settings.mcp_allowed_hosts:
+        security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=list(settings.mcp_allowed_hosts),
+        )
+    elif settings.api_tokens:
+        # Rebinding needs a browser to relay calls, and a browser cannot
+        # attach the bearer token; Host stays the deployment edge's concern.
+        security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    else:
+        security = None    # dev-mode shim: the SDK's loopback-only default
+    mcp = FastMCP("memoramum", stateless_http=True, transport_security=security)
+
+    def resolve() -> tuple[Principal, Flow]:
+        request = mcp.get_context().request_context.request
+        if request is None:
+            raise PrincipalError("no HTTP request context to resolve a principal from")
+        headers = request.headers
+        token_actor = request.scope.get("memoramum.actor")
+        asserted = headers.get("x-memoramum-actor")
+        if token_actor and asserted and asserted != token_actor:
+            raise PrincipalError(
+                f"X-Memoramum-Actor {asserted!r} does not match the token's principal"
+            )
+        actor = token_actor or asserted
+        if actor is None:
+            raise PrincipalError("no principal: dev mode requires X-Memoramum-Actor")
+        principal = Principal(actor, headers.get("x-memoramum-on-behalf-of") or None)
+        flow = Flow(
+            surface=headers.get("x-memoramum-surface"),
+            container=headers.get("x-memoramum-container"),
+            participants=_split(headers.get("x-memoramum-participants", "")),
+            session_id=headers.get("x-memoramum-session"),
+            project=headers.get("x-memoramum-project") or None,
+            touched_paths=_split(headers.get("x-memoramum-touched-paths", "")),
+        )
+        return principal, flow
+
+    _register(mcp, service, resolve)
+    return mcp
+
+
+class _BearerAuthMiddleware:
+    """ADR-0014 at the MCP door: a missing or unknown bearer token is
+    refused with HTTP 401 before any JSON-RPC processing; the token-bound
+    actor rides the ASGI scope so per-call resolution never re-derives
+    identity from a raw credential. With no tokens configured this is a
+    pass-through — the dev-mode header shim applies (loopback only)."""
+
+    def __init__(self, app, api_tokens: tuple[tuple[str, str], ...]):
+        self.app = app
+        self.api_tokens = api_tokens
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not self.api_tokens:
+            return await self.app(scope, receive, send)
+        authorization = ""
+        for name, value in scope.get("headers", []):
+            if name == b"authorization":
+                authorization = value.decode("latin-1")
+        scheme, _, rest = authorization.partition(" ")
+        credential = rest.strip() if scheme.lower() == "bearer" else ""
+        if not credential:
+            return await self._refuse(send, "bearer token required")
+        actor = None
+        for principal, token in self.api_tokens:      # constant-shape scan, no early exit
+            if secrets.compare_digest(credential, token):
+                actor = principal
+        if actor is None:
+            return await self._refuse(send, "unknown bearer token")
+        scope = dict(scope)
+        scope["memoramum.actor"] = actor
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _refuse(send, detail: str) -> None:
+        body = json.dumps({"detail": detail}).encode()
+        await send({
+            "type": "http.response.start", "status": 401,
+            "headers": [(b"content-type", b"application/json"),
+                        (b"www-authenticate", b"Bearer"),
+                        (b"content-length", str(len(body)).encode())],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+def create_mcp_app(service: MemoryService | None = None, settings: Settings | None = None):
+    """The remote facade as an ASGI app (mounted at /mcp), auth included."""
+    settings = settings or settings_from_env()
+    svc = service or MemoryService(make_pool(settings.database_url), settings)
+    return _BearerAuthMiddleware(
+        build_remote_server(svc, settings).streamable_http_app(), settings.api_tokens
+    )
 
 
 def main() -> None:
     settings = settings_from_env()
+    transport = os.environ.get("MEMORAMUM_MCP_TRANSPORT", "stdio")
+
+    if transport == "http":
+        import uvicorn
+
+        host = os.environ.get("MEMORAMUM_MCP_HOST", "127.0.0.1")
+        port = int(os.environ.get("MEMORAMUM_MCP_PORT", "8386"))
+        if not settings.api_tokens and host not in ("127.0.0.1", "::1", "localhost"):
+            raise SystemExit(
+                "refusing to bind beyond loopback without MEMORAMUM_API_TOKENS — "
+                "the dev-mode shim trusts asserted principals (ADR-0014, ADR-0015)"
+            )
+        uvicorn.run(create_mcp_app(settings=settings), host=host, port=port)
+        return
+    if transport != "stdio":
+        raise SystemExit(f"unknown MEMORAMUM_MCP_TRANSPORT {transport!r}: expected stdio or http")
+
     principal = Principal(
         os.environ["MEMORAMUM_AGENT"], os.environ.get("MEMORAMUM_ON_BEHALF_OF") or None
-    )
-    participants = tuple(
-        p.strip() for p in os.environ.get("MEMORAMUM_PARTICIPANTS", "").split(",") if p.strip()
-    )
-    touched_paths = tuple(
-        p.strip() for p in os.environ.get("MEMORAMUM_TOUCHED_PATHS", "").split(",") if p.strip()
     )
     flow = Flow(
         surface=os.environ.get("MEMORAMUM_SURFACE"),
         container=os.environ.get("MEMORAMUM_CONTAINER"),
-        participants=participants,
+        participants=_split(os.environ.get("MEMORAMUM_PARTICIPANTS", "")),
         session_id=os.environ.get("MEMORAMUM_SESSION"),
         project=os.environ.get("MEMORAMUM_PROJECT") or None,
-        touched_paths=touched_paths,
+        touched_paths=_split(os.environ.get("MEMORAMUM_TOUCHED_PATHS", "")),
     )
     service = MemoryService(make_pool(settings.database_url), settings)
     build_server(service, principal, flow).run()
