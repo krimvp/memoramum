@@ -8,11 +8,17 @@ adds the seventh verb, memory_observe: the dev-time episode-registration
 path for personal agents whose surface has no platform-side subscriber
 (ADR-0012).
 
-One server process serves one session context: the principal pair and the
-flow (surface, container, participants) come from the environment the
-surface integration launches the server with. Agents therefore never name
-raw scope ids — they describe nothing; the launcher already did
-(doc 04: "the service decides what that makes visible").
+The facade runs over two transports. Over **stdio** (this module's entry
+point), one server process serves one session context: the principal pair
+and the flow (surface, container, participants) come from the environment
+the surface integration launches the server with. Over **streamable HTTP**
+(mcp_http.py, ADR-0015), the same tools are served remotely: the bearer
+token names the actor and the flow arrives as X-Memoramum-* headers.
+Either way agents never name raw scope ids — they describe nothing; the
+launcher (or the request) already did (doc 04: "the service decides what
+that makes visible"). Tools therefore take a `resolve` callable yielding
+the (principal, flow) of the current call: process-fixed for stdio,
+per-request for HTTP.
 
     MEMORAMUM_AGENT=agent:sage MEMORAMUM_ON_BEHALF_OF=user:dana \
     MEMORAMUM_SURFACE=slack MEMORAMUM_CONTAINER=channel/C0DEP \
@@ -25,6 +31,7 @@ from __future__ import annotations
 import functools
 import os
 from datetime import datetime
+from typing import Callable
 
 import psycopg
 from mcp.server.fastmcp import FastMCP
@@ -34,6 +41,8 @@ from .config import settings_from_env
 from .db import make_pool
 from .principals import Flow, Principal
 from .service import MemoryService, PolicyUnavailable
+
+Identity = Callable[[], tuple[Principal, Flow]]
 
 PROMPT_CONTRACT = """\
 You have a memory service (Memoramum). Use it under this contract:
@@ -82,7 +91,7 @@ def _degrades(fn):
     return wrapper
 
 
-def build_server(service: MemoryService, principal: Principal, flow: Flow) -> FastMCP:
+def build_server(service: MemoryService, resolve: Identity) -> FastMCP:
     mcp = FastMCP("memoramum")
 
     @mcp.tool()
@@ -101,6 +110,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         explicit_user_ask only when the user actually asked. The response is
         the policy verdict (allow | stage | ask | deny) — honor it; a deny is
         final for this write."""
+        principal, flow = resolve()
         return service.remember(
             principal, flow, content=content, kind=kind, origin_kind=origin_kind,
             subjects=subjects, categories=categories, justification=justification,
@@ -119,6 +129,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         """Search memory mid-task (deliberate recall). Use before answering
         anything about a person, team, process, or past decision. Each result
         carries a provenance hint — weigh it, and cite it where useful."""
+        principal, flow = resolve()
         return service.recall(
             principal, flow, query=query, kinds=kinds, subjects=subjects,
             include_staged=include_staged, limit=limit,
@@ -131,6 +142,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         and it was right (this is what earns staged memories their active
         status); signal='wrong' when it misled — that lowers confidence and
         queues it for contradiction review, no forget powers needed."""
+        principal, flow = resolve()
         return service.reinforce(principal, flow, memory_id=memory_id, signal=signal, note=note)
 
     @mcp.tool()
@@ -143,6 +155,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         close it with memory_confirm. Use with the user's ask ("forget
         that") to fulfil a user forget — never claim to have forgotten
         unless the tool confirmed it."""
+        principal, flow = resolve()
         return service.forget(principal, flow, memory_id=memory_id, reason=reason, mode=mode)
 
     @mcp.tool()
@@ -152,6 +165,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         subject scope. Almost always returns `ask` — relay the ask_prompt to
         the human verbatim and close it with memory_confirm. The one tool
         where you name a scope; the service validates you may write there."""
+        principal, flow = resolve()
         return service.promote(
             principal, flow, memory_id=memory_id, target_scope=target_scope,
             justification=justification,
@@ -163,6 +177,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         """Close an `ask`: relay the user's answer to a pending question from
         memory_remember or memory_promote. Only report what the user actually
         said — the confirmation is recorded as the human's decision."""
+        principal, _ = resolve()
         return service.confirm_pending(principal, pending_id, approved=approved, note=note)
 
     @mcp.tool()
@@ -180,6 +195,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         observation is about — they route codebase conventions to the right
         module scope. Extraction (not this tool) proposes memories from what
         you observe; enrollment still gates the write."""
+        principal, flow = resolve()
         external_ref: dict = {"paths": list(paths or [])}
         if ref:
             external_ref["ref"] = ref
@@ -200,6 +216,7 @@ def build_server(service: MemoryService, principal: Principal, flow: Flow) -> Fa
         provenance, event digest), subject (everything known about a
         principal, e.g. 'user:dana'), or scope (a scope's inventory). This is
         how "what do you know about me?" gets answered in-surface."""
+        principal, _ = resolve()
         return service.status(principal, memory_id=memory_id, subject=subject, scope=scope)
 
     @mcp.prompt()
@@ -230,4 +247,4 @@ def main() -> None:
         touched_paths=touched_paths,
     )
     service = MemoryService(make_pool(settings.database_url), settings)
-    build_server(service, principal, flow).run()
+    build_server(service, lambda: (principal, flow)).run()

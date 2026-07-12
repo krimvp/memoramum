@@ -18,7 +18,9 @@ docker-compose.yml            dev Postgres 16 + pgvector (ADR-0004 stack)
 src/memoramum/                reference implementation, P5 (ADR-0007):
                               migrations/ = the doc 02 DDL verbatim (plus operational tables);
                               service.py = API core; rest.py / mcp_server.py = the two facades
-                              (ADR-0005); scopes.py, events.py, policy.py, retrieval.py =
+                              (ADR-0005); mcp_http.py = the MCP facade's streamable-HTTP
+                              transport, served at /mcp on the REST deployment (ADR-0015);
+                              scopes.py, events.py, policy.py, retrieval.py =
                               docs 01/02/05/04; lifecycle.py = the doc 03 rules (judge,
                               reinforcement, promotion); pii.py = the doc 06 §4 pipeline;
                               extraction.py = the doc 07 §1 workers; consolidator.py = the

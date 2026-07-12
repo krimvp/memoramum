@@ -11,7 +11,7 @@ from memoramum.mcp_server import build_server
 
 @pytest.fixture(scope="module")
 def server(svc):
-    return build_server(svc, SAGE_FOR_DANA, DEPLOYS_FLOW)
+    return build_server(svc, lambda: (SAGE_FOR_DANA, DEPLOYS_FLOW))
 
 
 async def test_tool_surface(server):

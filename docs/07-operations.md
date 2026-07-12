@@ -54,7 +54,7 @@ Decision recorded in [ADR-0004](adr/0004-postgres-reference-stack.md); summary:
 | Primary store | **Postgres 16+ with pgvector** | Memories, episodes, events, scopes, policy in *one transactional store*: a write + its provenance + its event commit atomically. HNSW + tsvector give hybrid retrieval natively. RLS as defense-in-depth under the API core. Single-org scale (≤ low millions of memories, ≤ thousands of QPS reads) is comfortably inside Postgres territory. |
 | Queue | any boring queue (SQS / Postgres-based) | Debounce and sweeps need at-least-once + delay, nothing exotic. |
 | Policy engine | in-service evaluation over policy tables | ReBAC tables kept SpiceDB/OpenFGA-isomorphic; OPA sidecar as documented escape hatch ([doc 05 §2](05-policy.md), §4). |
-| Facades | MCP server + REST | [ADR-0005](adr/0005-standalone-service-mcp.md). |
+| Facades | MCP server (stdio + streamable HTTP at `/mcp`) + REST | [ADR-0005](adr/0005-standalone-service-mcp.md), [ADR-0015](adr/0015-mcp-over-streamable-http.md). Only the facade port is exposed; Postgres stays private to the deployment. |
 
 **When to revisit** (the triggers table, so this doesn't ossify):
 

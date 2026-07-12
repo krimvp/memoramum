@@ -4,7 +4,7 @@ How agents actually use the system: the tool surface, the two read paths, the wr
 
 The service exposes two facades over one API core ([ADR-0005](adr/0005-standalone-service-mcp.md)):
 
-- an **MCP server** — the primary agent-facing surface; tools below are MCP tool definitions;
+- an **MCP server** — the primary agent-facing surface; tools below are MCP tool definitions. It runs over two transports: **stdio**, launched by a co-located surface integration with the principal pair and flow in its environment, and **streamable HTTP** at `/mcp` on the deployment — bearer-token-authenticated, flow context asserted per request as `X-Memoramum-*` headers — for remote personal harnesses that must never hold database credentials ([ADR-0015](adr/0015-mcp-over-streamable-http.md));
 - a **REST/gRPC API** — for platform code (session bootstrapping, review UIs, admin, audit queries).
 
 Every call is authenticated as a principal pair (`agent`, optional `on_behalf_of` user) and carries a **flow context** — surface, container, session id — from which the service resolves the scope chain. For dev-time flows (`surface:ide`) the context also names the project it works against and the paths it touched, which the service maps onto the *existing* `project/*` and `module:*` scopes ([ADR-0012](adr/0012-dev-time-agent-surface.md)). Agents never name raw scope ids in reads; they describe where they are, the service decides what that makes visible.
@@ -188,6 +188,8 @@ The contract is persuasive; the *enforcement* is server-side policy ([doc 05](05
 ## 5. REST surface (platform/admin)
 
 REST callers authenticate with **bearer tokens bound to principals** ([ADR-0014](adr/0014-bearer-token-rest-auth.md)): the deployment issues each platform component, admin, or reviewer a token, and the token — not a caller-asserted header — names the `actor` of every call (`401` without a valid token; `403` when a request asserts a different actor than its token is bound to). `on_behalf_of` stays caller-asserted, the same trust extended to the surface integration that launches the MCP server with the principal pair in its environment ([ADR-0005](adr/0005-standalone-service-mcp.md)). `/healthz` is open; with no tokens configured the facade runs an unauthenticated dev-mode shim that refuses to bind beyond loopback.
+
+The same tokens authenticate the MCP facade's streamable-HTTP transport at `/mcp` ([ADR-0015](adr/0015-mcp-over-streamable-http.md)): a remote harness's token is bound to its `agent:*` principal — issued per agent, never shared — and the flow context a stdio launcher would pass as environment variables arrives as `X-Memoramum-On-Behalf-Of` / `-Surface` / `-Container` / `-Participants` / `-Session` / `-Project` / `-Touched-Paths` headers, the same caller-asserted trust, fenced the same way ([doc 05 §4.1](05-policy.md)).
 
 | Endpoint | Purpose |
 |---|---|
