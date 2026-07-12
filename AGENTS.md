@@ -13,7 +13,7 @@ the docs mutually consistent *and* keeping `src/` an exact implementation of the
 README.md                     entry point: pitch, worked scenario, doc map, GLOSSARY (normative)
 index.html                    self-contained static page: high-level design overview
 pyproject.toml, Makefile      Python package + dev entry points (venv/db/migrate/test/api/
-                              mcp/consolidate/extract)
+                              mcp/seed/consolidate/extract)
 docker-compose.yml            dev Postgres 16 + pgvector (ADR-0004 stack)
 src/memoramum/                reference implementation, P5 (ADR-0007):
                               migrations/ = the doc 02 DDL verbatim (plus operational tables);

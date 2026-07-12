@@ -28,6 +28,7 @@ dev = [
 memoramum-api = "memoramum.rest:main"
 memoramum-mcp = "memoramum.mcp_server:main"
 memoramum-migrate = "memoramum.db:main"
+memoramum-seed = "memoramum.seed:main"
 memoramum-consolidate = "memoramum.consolidator:main"
 memoramum-extract = "memoramum.extraction:main"
 
