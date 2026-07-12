@@ -5,6 +5,27 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from .principals import validate_principal
+
+
+def parse_api_tokens(spec: str) -> tuple[tuple[str, str], ...]:
+    """Parse MEMORAMUM_API_TOKENS: comma-separated `principal=token`
+    entries (ADR-0014), e.g. 'user:admin=S3CRET,system:ingest=OTHER'.
+    Tokens therefore cannot contain a comma. Empty spec = no tokens =
+    the REST facade's unauthenticated dev mode."""
+    pairs: list[tuple[str, str]] = []
+    for entry in spec.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        principal, sep, token = entry.partition("=")
+        if not sep or not token.strip():
+            raise ValueError(
+                f"MEMORAMUM_API_TOKENS entry {entry!r}: expected 'principal=token'"
+            )
+        pairs.append((validate_principal(principal.strip()), token.strip()))
+    return tuple(pairs)
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -59,6 +80,12 @@ class Settings:
     # READ event. Only surfaces that heartbeat (membership_sync table) are
     # bounded — membership authored directly in the service can't go stale.
     membership_staleness_bound_seconds: int = 300
+
+    # REST bearer tokens, each bound to one principal (ADR-0014). Empty =
+    # the dev-mode header shim; the CLI then refuses non-loopback binds.
+    api_tokens: tuple = field(
+        default_factory=lambda: parse_api_tokens(os.environ.get("MEMORAMUM_API_TOKENS", ""))
+    )
 
     # Erasure attestations (doc 06 §2.2 step 5) are HMAC-signed with this
     # key; a real deployment injects one (MEMORAMUM_ATTESTATION_KEY).

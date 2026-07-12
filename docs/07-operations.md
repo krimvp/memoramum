@@ -25,7 +25,7 @@ The runtime shape of the service: the background machinery ("memory itself shoul
 
 - **Ingestion** subscribes to surface event streams and registers episodes (refs always, verbatim by policy). It also feeds the **membership sync** used by retrieval-time access checks ([doc 05 §4](05-policy.md)).
 - **Dev-time registration** — the personal `surface:ide` ([ADR-0012](adr/0012-dev-time-agent-surface.md)) has no platform-side subscriber; its MCP client pushes episodes directly via `memory_observe` ([doc 04 §1](04-agent-interface.md)) rather than through webhook-subscribed ingestion. Same write pipeline, lower `dev_observation` trust base.
-- **API core** is the single enforcement point: both facades route through it; nothing reaches Postgres except through it (plus RLS as defense-in-depth).
+- **API core** is the single enforcement point: both facades route through it; nothing reaches Postgres except through it (plus RLS as defense-in-depth). REST callers authenticate with principal-bound bearer tokens ([ADR-0014](adr/0014-bearer-token-rest-auth.md)); MCP sessions get their principal pair from the launching surface integration ([ADR-0005](adr/0005-standalone-service-mcp.md)).
 - **Extraction workers** implement `agent_observed` learning: debounced background reflection over recent episodes per scope (the LangMem `ReflectionExecutor` pattern — accumulate, cancel-and-reschedule on new activity, run at conversation-lull; default debounce 30 min, cap 4 h). Extraction proposes candidates through the same write pipeline as any agent — policy applies identically.
 - **Consolidator** — §2.
 - **Sweeps** — scheduled jobs for decay scoring, TTL/archival, erasure verification.
