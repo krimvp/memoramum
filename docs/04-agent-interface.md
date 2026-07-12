@@ -187,6 +187,8 @@ The contract is persuasive; the *enforcement* is server-side policy ([doc 05](05
 
 ## 5. REST surface (platform/admin)
 
+REST callers authenticate with **bearer tokens bound to principals** ([ADR-0014](adr/0014-bearer-token-rest-auth.md)): the deployment issues each platform component, admin, or reviewer a token, and the token — not a caller-asserted header — names the `actor` of every call (`401` without a valid token; `403` when a request asserts a different actor than its token is bound to). `on_behalf_of` stays caller-asserted, the same trust extended to the surface integration that launches the MCP server with the principal pair in its environment ([ADR-0005](adr/0005-standalone-service-mcp.md)). `/healthz` is open; with no tokens configured the facade runs an unauthenticated dev-mode shim that refuses to bind beyond loopback.
+
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/context-block` | ambient recall (§2.1) |

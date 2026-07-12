@@ -1,14 +1,18 @@
 """REST facade (doc 04 §5): platform code, review UIs, admin, audit.
 
-Identity in P1 is a dev-mode shim: the caller asserts its principal pair
-via `X-Memoramum-Actor` / `X-Memoramum-On-Behalf-Of` headers (the
-`/v1/context-block` body may carry the pair instead, matching the doc 04
-§2.1 example). Real authentication is a deployment concern that replaces
-this dependency, not the handlers.
+Identity: bearer tokens bound to principals (ADR-0014), configured via
+MEMORAMUM_API_TOKENS ('principal=token', comma-separated). The token
+names the actor; `on_behalf_of` — and the `/v1/context-block` body
+principal, which must match the token — stays caller-asserted. With no
+tokens configured the facade falls back to the dev-mode shim (the caller
+asserts its pair via `X-Memoramum-Actor` / `X-Memoramum-On-Behalf-Of`
+headers), and `main()` refuses to bind beyond loopback.
 """
 
 from __future__ import annotations
 
+import os
+import secrets
 from datetime import datetime
 from typing import Any
 
@@ -20,16 +24,6 @@ from .config import Settings, settings_from_env
 from .db import make_pool
 from .principals import Flow, Principal, PrincipalError
 from .service import AccessDenied, MemoryService, NotFound, PolicyUnavailable
-
-
-def principal_from_headers(
-    x_memoramum_actor: str = Header(...),
-    x_memoramum_on_behalf_of: str | None = Header(None),
-) -> Principal:
-    try:
-        return Principal(x_memoramum_actor, x_memoramum_on_behalf_of)
-    except PrincipalError as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
 
 class FlowBody(BaseModel):
@@ -153,6 +147,48 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
     svc = service or MemoryService(make_pool(settings.database_url), settings)
     app = FastAPI(title="memoramum", version="0.1.0")
 
+    api_tokens = settings.api_tokens
+
+    def bearer_actor(authorization: str | None = Header(None)) -> str | None:
+        """The token-bound actor (ADR-0014), or None in dev mode."""
+        if not api_tokens:
+            return None
+        credential = ""
+        if authorization:
+            scheme, _, rest = authorization.partition(" ")
+            if scheme.lower() == "bearer":
+                credential = rest.strip()
+        if not credential:
+            raise HTTPException(status_code=401, detail="bearer token required",
+                                headers={"WWW-Authenticate": "Bearer"})
+        actor = None
+        for principal, token in api_tokens:      # constant-shape scan, no early exit
+            if secrets.compare_digest(credential, token):
+                actor = principal
+        if actor is None:
+            raise HTTPException(status_code=401, detail="unknown bearer token",
+                                headers={"WWW-Authenticate": "Bearer"})
+        return actor
+
+    def request_principal(
+        token_actor: str | None = Depends(bearer_actor),
+        x_memoramum_actor: str | None = Header(None),
+        x_memoramum_on_behalf_of: str | None = Header(None),
+    ) -> Principal:
+        if token_actor and x_memoramum_actor and x_memoramum_actor != token_actor:
+            raise HTTPException(
+                status_code=403,
+                detail=f"X-Memoramum-Actor {x_memoramum_actor!r} does not match the token's principal",
+            )
+        actor = token_actor or x_memoramum_actor
+        if actor is None:
+            raise HTTPException(status_code=401,
+                                detail="no principal: dev mode requires X-Memoramum-Actor")
+        try:
+            return Principal(actor, x_memoramum_on_behalf_of)
+        except PrincipalError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
     @app.exception_handler(AccessDenied)
     async def _denied(request: Request, exc: AccessDenied):
         raise HTTPException(status_code=403, detail=str(exc))
@@ -187,21 +223,30 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
     @app.post("/v1/context-block")
     def context_block(
         body: ContextBlockRequest,
+        token_actor: str | None = Depends(bearer_actor),
         x_memoramum_actor: str | None = Header(None),
         x_memoramum_on_behalf_of: str | None = Header(None),
     ):
         if body.principal is not None:
-            principal = Principal(body.principal.agent, body.principal.on_behalf_of)
+            actor, on_behalf_of = body.principal.agent, body.principal.on_behalf_of
         elif x_memoramum_actor:
-            principal = Principal(x_memoramum_actor, x_memoramum_on_behalf_of)
+            actor, on_behalf_of = x_memoramum_actor, x_memoramum_on_behalf_of
         else:
+            actor, on_behalf_of = token_actor, x_memoramum_on_behalf_of
+        if actor is None:
             raise HTTPException(status_code=400, detail="no principal provided")
+        if token_actor and actor != token_actor:
+            raise HTTPException(
+                status_code=403,
+                detail=f"asserted principal {actor!r} does not match the token's principal",
+            )
+        principal = Principal(actor, on_behalf_of)
         return svc.context_block(
             principal, body.flow.to_flow(), focus=body.focus, token_budget=body.token_budget
         )
 
     @app.post("/v1/episodes")
-    def register_episode(body: EpisodeRequest, principal: Principal = Depends(principal_from_headers)):
+    def register_episode(body: EpisodeRequest, principal: Principal = Depends(request_principal)):
         return svc.register_episode(
             principal, scope_id=body.scope_id, source_kind=body.source_kind,
             external_ref=body.external_ref, content=body.content, author=body.author,
@@ -210,30 +255,30 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
 
     @app.post("/v1/membership-sync")
     def membership_sync(body: MembershipSyncRequest,
-                        principal: Principal = Depends(principal_from_headers)):
+                        principal: Principal = Depends(request_principal)):
         return svc.record_membership_sync(principal, surface=body.surface)
 
     @app.get("/v1/memories/{memory_id}")
-    def get_memory(memory_id: str, principal: Principal = Depends(principal_from_headers)):
+    def get_memory(memory_id: str, principal: Principal = Depends(request_principal)):
         return svc.get_memory(principal, memory_id)
 
     @app.get("/v1/memories/{memory_id}/history")
-    def memory_history(memory_id: str, principal: Principal = Depends(principal_from_headers)):
+    def memory_history(memory_id: str, principal: Principal = Depends(request_principal)):
         return svc.memory_history(principal, memory_id)
 
     @app.get("/v1/subjects/{subject}/memories")
-    def subject_memories(subject: str, principal: Principal = Depends(principal_from_headers)):
+    def subject_memories(subject: str, principal: Principal = Depends(request_principal)):
         return svc.subject_memories(principal, subject)
 
     @app.get("/v1/scopes/{scope_id:path}/memories")
-    def scope_memories(scope_id: str, principal: Principal = Depends(principal_from_headers)):
+    def scope_memories(scope_id: str, principal: Principal = Depends(request_principal)):
         return svc.scope_memories(principal, scope_id)
 
     @app.get("/v1/audit/events")
     def audit_events(
         action: str | None = None, actor: str | None = None,
         memory_id: str | None = None, scope_id: str | None = None, limit: int = 100,
-        principal: Principal = Depends(principal_from_headers),
+        principal: Principal = Depends(request_principal),
     ):
         return svc.audit_events(
             principal, action=action, actor=actor, memory_id=memory_id,
@@ -241,17 +286,17 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
         )
 
     @app.get("/v1/metrics")
-    def metrics(days: int = 30, principal: Principal = Depends(principal_from_headers)):
+    def metrics(days: int = 30, principal: Principal = Depends(request_principal)):
         return svc.metrics(principal, days=days)
 
     @app.get("/v1/episodes/{episode_id}")
-    def get_episode(episode_id: str, principal: Principal = Depends(principal_from_headers)):
+    def get_episode(episode_id: str, principal: Principal = Depends(request_principal)):
         return svc.get_episode(principal, episode_id)
 
     # --- scope tree & enrollment admin ---
 
     @app.post("/v1/scopes")
-    def create_scope(body: ScopeRequest, principal: Principal = Depends(principal_from_headers)):
+    def create_scope(body: ScopeRequest, principal: Principal = Depends(request_principal)):
         return svc.create_scope(
             principal, scope_id=body.id, family=body.family,
             parent_scope_id=body.parent_scope_id, surface=body.surface,
@@ -260,7 +305,7 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
 
     @app.post("/v1/scopes/{scope_id:path}/relations")
     def set_relation(scope_id: str, body: RelationRequest,
-                     principal: Principal = Depends(principal_from_headers)):
+                     principal: Principal = Depends(request_principal)):
         svc.set_relation(principal, scope_id, body.relation, body.principal, remove=body.remove)
         return {"ok": True}
 
@@ -268,7 +313,7 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
     # scope (org-admin/system; replace semantics).
     @app.post("/v1/module-paths")
     def set_module_paths(body: ModulePathsRequest,
-                         principal: Principal = Depends(principal_from_headers)):
+                         principal: Principal = Depends(request_principal)):
         return svc.set_module_paths(
             principal, module_scope_id=body.module_scope_id, globs=body.globs
         )
@@ -277,50 +322,50 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
 
     @app.get("/v1/review/staged")
     def staged_queue(scope_id: str | None = None,
-                     principal: Principal = Depends(principal_from_headers)):
+                     principal: Principal = Depends(request_principal)):
         return svc.staged_queue(principal, scope_id=scope_id)
 
     @app.post("/v1/memories/{memory_id}/review")
     def review_memory(memory_id: str, body: ReviewRequest,
-                      principal: Principal = Depends(principal_from_headers)):
+                      principal: Principal = Depends(request_principal)):
         return svc.review_staged(principal, memory_id, action=body.action, note=body.note)
 
     @app.get("/v1/review/contradictions")
     def contradiction_queue(include_resolved: bool = False,
-                            principal: Principal = Depends(principal_from_headers)):
+                            principal: Principal = Depends(request_principal)):
         return svc.contradictions(principal, include_resolved=include_resolved)
 
     # --- ask confirmations (doc 04 §1, doc 06 §1.2) ---
 
     @app.get("/v1/review/pending")
     def pending_queue(scope_id: str | None = None,
-                      principal: Principal = Depends(principal_from_headers)):
+                      principal: Principal = Depends(request_principal)):
         return svc.pending_queue(principal, scope_id=scope_id)
 
     @app.post("/v1/review/pending/{pending_id}")
     def resolve_pending(pending_id: str, body: PendingResolutionRequest,
-                        principal: Principal = Depends(principal_from_headers)):
+                        principal: Principal = Depends(request_principal)):
         return svc.confirm_pending(principal, pending_id, approved=body.approved,
                                    note=body.note)
 
     # --- policy administration (doc 05 §5) ---
 
     @app.get("/v1/policies")
-    def list_policies(principal: Principal = Depends(principal_from_headers)):
+    def list_policies(principal: Principal = Depends(request_principal)):
         return svc.policies(principal)
 
     @app.post("/v1/policies")
-    def put_policy(body: PolicyRequest, principal: Principal = Depends(principal_from_headers)):
+    def put_policy(body: PolicyRequest, principal: Principal = Depends(request_principal)):
         return svc.put_policy(principal, body.document)
 
     @app.post("/v1/policies/simulate")
     def simulate_policy(body: SimulationRequest,
-                        principal: Principal = Depends(principal_from_headers)):
+                        principal: Principal = Depends(request_principal)):
         return svc.simulate_policy(principal, body.document, days=body.days)
 
     @app.post("/v1/review/contradictions/{queue_id}")
     def resolve_contradiction(queue_id: str, body: ResolutionRequest,
-                              principal: Principal = Depends(principal_from_headers)):
+                              principal: Principal = Depends(request_principal)):
         return svc.resolve_contradiction(
             principal, queue_id, resolution=body.resolution,
             invalid_at=body.invalid_at, note=body.note,
@@ -330,24 +375,24 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
 
     @app.post("/v1/memories/{memory_id}/forget")
     def forget_memory(memory_id: str, body: ForgetRequest,
-                      principal: Principal = Depends(principal_from_headers)):
+                      principal: Principal = Depends(request_principal)):
         return svc.forget(principal, Flow(), memory_id=memory_id,
                           reason=body.reason, mode=body.mode)
 
     @app.post("/v1/erasure-requests")
     def request_erasure(body: ErasureRequest,
-                        principal: Principal = Depends(principal_from_headers)):
+                        principal: Principal = Depends(request_principal)):
         return svc.request_erasure(principal, subject=body.subject,
                                    legal_basis=body.legal_basis, note=body.note)
 
     @app.get("/v1/erasure-requests/{request_id}")
     def erasure_request(request_id: str,
-                        principal: Principal = Depends(principal_from_headers)):
+                        principal: Principal = Depends(request_principal)):
         return svc.erasure_request(principal, request_id)
 
     @app.post("/v1/quarantine")
     def quarantine(body: QuarantineRequest,
-                   principal: Principal = Depends(principal_from_headers)):
+                   principal: Principal = Depends(request_principal)):
         return svc.quarantine(
             principal, episode_id=body.episode_id, author=body.author,
             source_kind=body.source_kind, agent=body.agent, scope_id=body.scope_id,
@@ -356,18 +401,18 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
 
     @app.get("/v1/quarantine")
     def quarantine_queue(include_resolved: bool = False,
-                         principal: Principal = Depends(principal_from_headers)):
+                         principal: Principal = Depends(request_principal)):
         return svc.quarantine_queue(principal, include_resolved=include_resolved)
 
     @app.post("/v1/quarantine/{request_id}")
     def resolve_quarantine(request_id: str, body: QuarantineResolution,
-                           principal: Principal = Depends(principal_from_headers)):
+                           principal: Principal = Depends(request_principal)):
         return svc.resolve_quarantine(principal, request_id, body.memory_id,
                                       action=body.action, note=body.note)
 
     @app.post("/v1/agents/{agent}/freeze")
     def freeze_agent(agent: str, body: FreezeRequest,
-                     principal: Principal = Depends(principal_from_headers)):
+                     principal: Principal = Depends(request_principal)):
         return svc.set_agent_freeze(principal, agent, frozen=body.frozen,
                                     reason=body.reason)
 
@@ -377,4 +422,12 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
 def main() -> None:
     import uvicorn
 
-    uvicorn.run(create_app(), host="127.0.0.1", port=8385)
+    settings = settings_from_env()
+    host = os.environ.get("MEMORAMUM_API_HOST", "127.0.0.1")
+    port = int(os.environ.get("MEMORAMUM_API_PORT", "8385"))
+    if not settings.api_tokens and host not in ("127.0.0.1", "::1", "localhost"):
+        raise SystemExit(
+            "refusing to bind beyond loopback without MEMORAMUM_API_TOKENS — "
+            "the dev-mode shim trusts asserted principals (ADR-0014)"
+        )
+    uvicorn.run(create_app(settings=settings), host=host, port=port)

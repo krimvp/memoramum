@@ -29,6 +29,8 @@ The last row is the one most systems cannot answer and the reason reads are logg
 - **Per-subject view**: `GET /v1/subjects/{principal}/memories` — "everything remembered about X", including staged and deprecated items. Exposed to end users through the surfaces themselves (in-chat "what do you know about me?" via `memory_status`) — **inferred memories are exactly as inspectable as explicit ones.** This is the deliberate inversion of ChatGPT's design, whose inferred chat-history insights are invisible; the non-auditable-inference gap is the single most criticized property of deployed memory systems.
 - **Per-scope inventory**: what does this channel's memory contain (channel admins).
 - **Event-log queries** (admin/audit role): by actor, action, time window, rule id.
+
+These REST surfaces authenticate callers with principal-bound bearer tokens ([ADR-0014](adr/0014-bearer-token-rest-auth.md)) — the audit trail only means something if every `actor` it records was proven, not asserted.
 - **Review UI** (product surface, out of scope here but assumed): staged-memory triage, `ask` confirmations, forget buttons, promotion requests.
 
 ### 1.3 Integrity
