@@ -131,7 +131,7 @@ def test_policy_unreachable_restricts_reads_to_own_agent_scope(svc, monkeypatch)
 
 
 async def test_mcp_tools_return_explicit_unavailability(svc, monkeypatch):
-    server = build_server(svc, lambda: (SAGE_FOR_DANA, DEPLOYS_FLOW))
+    server = build_server(svc, SAGE_FOR_DANA, DEPLOYS_FLOW)
 
     def store_down(*a, **kw):
         raise psycopg.OperationalError("connection refused")

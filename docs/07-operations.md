@@ -25,7 +25,7 @@ The runtime shape of the service: the background machinery ("memory itself shoul
 
 - **Ingestion** subscribes to surface event streams and registers episodes (refs always, verbatim by policy). It also feeds the **membership sync** used by retrieval-time access checks ([doc 05 §4](05-policy.md)).
 - **Dev-time registration** — the personal `surface:ide` ([ADR-0012](adr/0012-dev-time-agent-surface.md)) has no platform-side subscriber; its MCP client pushes episodes directly via `memory_observe` ([doc 04 §1](04-agent-interface.md)) rather than through webhook-subscribed ingestion. Same write pipeline, lower `dev_observation` trust base.
-- **API core** is the single enforcement point: both facades route through it; nothing reaches Postgres except through it (plus RLS as defense-in-depth). REST callers authenticate with principal-bound bearer tokens ([ADR-0014](adr/0014-bearer-token-rest-auth.md)); MCP sessions get their principal pair from the launching surface integration ([ADR-0005](adr/0005-standalone-service-mcp.md)).
+- **API core** is the single enforcement point: both facades route through it; nothing reaches Postgres except through it (plus RLS as defense-in-depth). REST callers authenticate with principal-bound bearer tokens ([ADR-0014](adr/0014-bearer-token-rest-auth.md)); MCP sessions get their principal pair from the launching surface integration ([ADR-0005](adr/0005-standalone-service-mcp.md)) or — connecting remotely over streamable HTTP — from the same bearer tokens, with the flow asserted per request ([ADR-0015](adr/0015-remote-mcp-streamable-http.md)).
 - **Extraction workers** implement `agent_observed` learning: debounced background reflection over recent episodes per scope (the LangMem `ReflectionExecutor` pattern — accumulate, cancel-and-reschedule on new activity, run at conversation-lull; default debounce 30 min, cap 4 h). Extraction proposes candidates through the same write pipeline as any agent — policy applies identically.
 - **Consolidator** — §2.
 - **Sweeps** — scheduled jobs for decay scoring, TTL/archival, erasure verification.
@@ -54,7 +54,7 @@ Decision recorded in [ADR-0004](adr/0004-postgres-reference-stack.md); summary:
 | Primary store | **Postgres 16+ with pgvector** | Memories, episodes, events, scopes, policy in *one transactional store*: a write + its provenance + its event commit atomically. HNSW + tsvector give hybrid retrieval natively. RLS as defense-in-depth under the API core. Single-org scale (≤ low millions of memories, ≤ thousands of QPS reads) is comfortably inside Postgres territory. |
 | Queue | any boring queue (SQS / Postgres-based) | Debounce and sweeps need at-least-once + delay, nothing exotic. |
 | Policy engine | in-service evaluation over policy tables | ReBAC tables kept SpiceDB/OpenFGA-isomorphic; OPA sidecar as documented escape hatch ([doc 05 §2](05-policy.md), §4). |
-| Facades | MCP server (stdio + streamable HTTP at `/mcp`) + REST | [ADR-0005](adr/0005-standalone-service-mcp.md), [ADR-0015](adr/0015-mcp-over-streamable-http.md). Only the facade port is exposed; Postgres stays private to the deployment. |
+| Facades | MCP server (stdio + streamable HTTP) + REST | [ADR-0005](adr/0005-standalone-service-mcp.md), [ADR-0015](adr/0015-remote-mcp-streamable-http.md). |
 
 **When to revisit** (the triggers table, so this doesn't ossify):
 

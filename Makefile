@@ -1,4 +1,4 @@
-.PHONY: venv db migrate test api consolidate extract
+.PHONY: venv db migrate test api mcp consolidate extract
 
 venv:
 	python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
@@ -15,6 +15,9 @@ test:
 
 api: migrate
 	.venv/bin/memoramum-api
+
+mcp: migrate
+	MEMORAMUM_MCP_TRANSPORT=http .venv/bin/memoramum-mcp
 
 consolidate: migrate
 	.venv/bin/memoramum-consolidate

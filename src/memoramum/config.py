@@ -114,6 +114,20 @@ class Settings:
         default_factory=lambda: parse_api_tokens(os.environ.get("MEMORAMUM_API_TOKENS", ""))
     )
 
+    # Host allowlist for the remote MCP endpoint (ADR-0015). Non-empty:
+    # DNS-rebinding protection validates Host against it (entries may end
+    # ':*' for any port). Empty with tokens configured: protection off —
+    # bearer auth already fences browser-originated calls, and the public
+    # hostname is the deployment's business. Empty without tokens: the
+    # SDK's loopback-only default guards the dev-mode shim.
+    mcp_allowed_hosts: tuple = field(
+        default_factory=lambda: tuple(
+            h.strip()
+            for h in os.environ.get("MEMORAMUM_MCP_ALLOWED_HOSTS", "").split(",")
+            if h.strip()
+        )
+    )
+
     # Erasure attestations (doc 06 §2.2 step 5) are HMAC-signed with this
     # key; a real deployment injects one (MEMORAMUM_ATTESTATION_KEY).
     attestation_key: str = field(

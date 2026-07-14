@@ -137,9 +137,11 @@
                          └────────────────────────────────────────────┘</code></pre>
   <p>Design choices behind the shape: it is a <strong>standalone service</strong> so policy and
   audit are unbypassable — no agent embeds the storage layer (ADR-0005). Agents speak
-  <strong>MCP</strong> (six tools: <code>memory_recall</code>, <code>memory_remember</code>,
+  <strong>MCP</strong>, and only MCP (seven tools: <code>memory_recall</code>, <code>memory_remember</code>,
   <code>memory_reinforce</code>, <code>memory_forget</code>, <code>memory_promote</code>,
-  <code>memory_status</code>); platform code uses REST. Everything lives in <strong>one
+  <code>memory_status</code>, and dev-time <code>memory_observe</code> — plus
+  <code>memory_confirm</code>, the closing half of every <em>ask</em>), launched per session
+  or connected remotely over streamable HTTP (ADR-0015); platform code uses REST. Everything lives in <strong>one
   Postgres</strong> (+pgvector) so a memory, its provenance, its policy decision, and its audit
   event commit in a single transaction (ADR-0004). Background workers — extraction, the
   <strong>consolidator</strong>, sweeps — produce memory <em>quality</em> offline so the hot path
