@@ -12,7 +12,6 @@ headers), and `main()` refuses to bind beyond loopback.
 from __future__ import annotations
 
 import os
-import secrets
 from datetime import datetime
 from typing import Any
 
@@ -20,7 +19,7 @@ import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from .config import Settings, settings_from_env
+from .config import Settings, resolve_bearer_actor, settings_from_env
 from .db import make_pool
 from .principals import Flow, Principal, PrincipalError
 from .service import AccessDenied, MemoryService, NotFound, PolicyUnavailable
@@ -151,24 +150,11 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
 
     def bearer_actor(authorization: str | None = Header(None)) -> str | None:
         """The token-bound actor (ADR-0014), or None in dev mode."""
-        if not api_tokens:
-            return None
-        credential = ""
-        if authorization:
-            scheme, _, rest = authorization.partition(" ")
-            if scheme.lower() == "bearer":
-                credential = rest.strip()
-        if not credential:
-            raise HTTPException(status_code=401, detail="bearer token required",
+        try:
+            return resolve_bearer_actor(api_tokens, authorization)
+        except LookupError as e:
+            raise HTTPException(status_code=401, detail=str(e),
                                 headers={"WWW-Authenticate": "Bearer"})
-        actor = None
-        for principal, token in api_tokens:      # constant-shape scan, no early exit
-            if secrets.compare_digest(credential, token):
-                actor = principal
-        if actor is None:
-            raise HTTPException(status_code=401, detail="unknown bearer token",
-                                headers={"WWW-Authenticate": "Bearer"})
-        return actor
 
     def request_principal(
         token_actor: str | None = Depends(bearer_actor),

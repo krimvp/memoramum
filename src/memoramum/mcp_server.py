@@ -39,7 +39,6 @@ from __future__ import annotations
 import functools
 import json
 import os
-import secrets
 from datetime import datetime
 from typing import Callable
 
@@ -48,7 +47,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from psycopg_pool import PoolTimeout
 
-from .config import Settings, settings_from_env
+from .config import Settings, resolve_bearer_actor, settings_from_env
 from .db import make_pool
 from .principals import Flow, Principal, PrincipalError
 from .service import MemoryService, PolicyUnavailable
@@ -315,16 +314,10 @@ class _BearerAuthMiddleware:
         for name, value in scope.get("headers", []):
             if name == b"authorization":
                 authorization = value.decode("latin-1")
-        scheme, _, rest = authorization.partition(" ")
-        credential = rest.strip() if scheme.lower() == "bearer" else ""
-        if not credential:
-            return await self._refuse(send, "bearer token required")
-        actor = None
-        for principal, token in self.api_tokens:      # constant-shape scan, no early exit
-            if secrets.compare_digest(credential, token):
-                actor = principal
-        if actor is None:
-            return await self._refuse(send, "unknown bearer token")
+        try:
+            actor = resolve_bearer_actor(self.api_tokens, authorization)
+        except LookupError as e:
+            return await self._refuse(send, str(e))
         scope = dict(scope)
         scope["memoramum.actor"] = actor
         await self.app(scope, receive, send)

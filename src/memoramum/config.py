@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from dataclasses import dataclass, field
 
 from .principals import validate_principal
@@ -25,6 +26,32 @@ def parse_api_tokens(spec: str) -> tuple[tuple[str, str], ...]:
             )
         pairs.append((validate_principal(principal.strip()), token.strip()))
     return tuple(pairs)
+
+
+def resolve_bearer_actor(
+    api_tokens: tuple[tuple[str, str], ...], authorization: str | None
+) -> str | None:
+    """The ADR-0014 resolver, shared by both facades (REST and the
+    streamable-HTTP MCP endpoint, ADR-0015): the principal bound to the
+    presented bearer credential. Returns None when no tokens are
+    configured (the dev-mode shim); raises LookupError for a missing or
+    unknown credential."""
+    if not api_tokens:
+        return None
+    credential = ""
+    if authorization:
+        scheme, _, rest = authorization.partition(" ")
+        if scheme.lower() == "bearer":
+            credential = rest.strip()
+    if not credential:
+        raise LookupError("bearer token required")
+    actor = None
+    for principal, token in api_tokens:      # constant-shape scan, no early exit
+        if secrets.compare_digest(credential, token):
+            actor = principal
+    if actor is None:
+        raise LookupError("unknown bearer token")
+    return actor
 
 
 @dataclass(frozen=True)
