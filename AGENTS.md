@@ -18,7 +18,8 @@ docker-compose.yml            dev Postgres 16 + pgvector (ADR-0004 stack)
 src/memoramum/                reference implementation, P5 (ADR-0007):
                               migrations/ = the doc 02 DDL verbatim (plus operational tables);
                               service.py = API core; rest.py / mcp_server.py = the two facades
-                              (ADR-0005); scopes.py, events.py, policy.py, retrieval.py =
+                              (ADR-0005), oauth.py = the OAuth resource-server door in front of
+                              both (ADR-0016); scopes.py, events.py, policy.py, retrieval.py =
                               docs 01/02/05/04; lifecycle.py = the doc 03 rules (judge,
                               reinforcement, promotion); pii.py = the doc 06 §4 pipeline;
                               extraction.py = the doc 07 §1 workers; consolidator.py = the
@@ -42,7 +43,7 @@ docs/
                               PII pipeline
   07-operations.md            components, consolidator jobs, reference stack, SLOs, rollout
   appendix-prior-art.md       survey of Letta, Mem0, Zep/Graphiti, LangMem, etc.
-  adr/000N-*.md               one-page records of the contested decisions (15 so far)
+  adr/000N-*.md               one-page records of the contested decisions (16 so far)
 ```
 
 Read `README.md` first, then docs in numeric order — each ends with a "Continue with"

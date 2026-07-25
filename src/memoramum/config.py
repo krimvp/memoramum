@@ -6,6 +6,13 @@ import os
 import secrets
 from dataclasses import dataclass, field
 
+from .oauth import (
+    AccessTokenVerifier,
+    OAuthSettings,
+    VerifiedCredential,
+    looks_like_jwt,
+    oauth_settings_from_env,
+)
 from .principals import validate_principal
 
 
@@ -28,30 +35,83 @@ def parse_api_tokens(spec: str) -> tuple[tuple[str, str], ...]:
     return tuple(pairs)
 
 
-def resolve_bearer_actor(
-    api_tokens: tuple[tuple[str, str], ...], authorization: str | None
-) -> str | None:
-    """The ADR-0014 resolver, shared by both facades (REST and the
-    streamable-HTTP MCP endpoint, ADR-0015): the principal bound to the
-    presented bearer credential. Returns None when no tokens are
-    configured (the dev-mode shim); raises LookupError for a missing or
-    unknown credential."""
-    if not api_tokens:
-        return None
-    credential = ""
+def bearer_credential(authorization: str | None) -> str:
+    """The credential out of an `Authorization: Bearer …` header, or ''."""
     if authorization:
         scheme, _, rest = authorization.partition(" ")
         if scheme.lower() == "bearer":
-            credential = rest.strip()
-    if not credential:
-        raise LookupError("bearer token required")
+            return rest.strip()
+    return ""
+
+
+def match_static_token(
+    api_tokens: tuple[tuple[str, str], ...], credential: str
+) -> VerifiedCredential | None:
+    """ADR-0014: the principal a deployment-configured token is bound to,
+    or None if the credential is not one of them."""
     actor = None
     for principal, token in api_tokens:      # constant-shape scan, no early exit
         if secrets.compare_digest(credential, token):
             actor = principal
-    if actor is None:
-        raise LookupError("unknown bearer token")
-    return actor
+    return VerifiedCredential(actor, source="static") if actor else None
+
+
+def plan_credential(
+    api_tokens: tuple[tuple[str, str], ...],
+    verifier: AccessTokenVerifier | None,
+    authorization: str | None,
+) -> tuple[VerifiedCredential | None, str]:
+    """The transport-independent half of the door both facades share (REST
+    and the streamable-HTTP MCP endpoint, ADR-0015). Returns either what
+    the credential already proved, or the access token still to verify.
+
+    Two credential kinds meet here on the seam ADR-0014 isolated: an
+    opaque static token from MEMORAMUM_API_TOKENS, matched first so a
+    configured credential is never mistaken for anything else, and an
+    OAuth access token from the deployment's authorization server
+    (ADR-0016), recognized by its JWS shape. `(None, "")` means neither is
+    configured — the dev-mode shim. Raises LookupError for a missing or
+    unrecognized credential."""
+    if not api_tokens and verifier is None:
+        return None, ""
+    credential = bearer_credential(authorization)
+    if not credential:
+        raise LookupError("bearer token required")
+    matched = match_static_token(api_tokens, credential)
+    if matched is not None:
+        return matched, ""
+    if verifier is not None and looks_like_jwt(credential):
+        return None, credential
+    raise LookupError("unknown bearer token")
+
+
+def resolve_credential(
+    api_tokens: tuple[tuple[str, str], ...],
+    verifier: AccessTokenVerifier | None,
+    authorization: str | None,
+) -> VerifiedCredential | None:
+    """What the presented credential proved (blocking; the async door in
+    the MCP facade offloads the verification step to a worker thread)."""
+    resolved, token = plan_credential(api_tokens, verifier, authorization)
+    if token:
+        assert verifier is not None
+        return verifier.verify(token)
+    return resolved
+
+
+def resolve_bearer_actor(
+    api_tokens: tuple[tuple[str, str], ...], authorization: str | None
+) -> str | None:
+    """The ADR-0014 resolver in its static-token-only form: the principal
+    bound to the presented bearer token, or None in dev mode."""
+    resolved = resolve_credential(api_tokens, None, authorization)
+    return resolved.actor if resolved else None
+
+
+def make_verifier(settings: "Settings") -> AccessTokenVerifier | None:
+    """The OAuth resource-server verifier, or None when this deployment
+    has no authorization server configured (ADR-0016)."""
+    return AccessTokenVerifier(settings.oauth) if settings.oauth.enabled else None
 
 
 @dataclass(frozen=True)
@@ -113,6 +173,13 @@ class Settings:
     api_tokens: tuple = field(
         default_factory=lambda: parse_api_tokens(os.environ.get("MEMORAMUM_API_TOKENS", ""))
     )
+
+    # OAuth 2.1 resource-server configuration (ADR-0016): the remote MCP
+    # endpoint publishes protected-resource metadata and accepts access
+    # tokens the deployment's authorization server issued for it. Unset =
+    # OAuth off, static tokens only. Both credential kinds resolve through
+    # the same seam, so tokens and OAuth can run side by side.
+    oauth: OAuthSettings = field(default_factory=oauth_settings_from_env)
 
     # Host allowlist for the remote MCP endpoint (ADR-0015). Non-empty:
     # DNS-rebinding protection validates Host against it (entries may end

@@ -141,7 +141,9 @@
   <code>memory_reinforce</code>, <code>memory_forget</code>, <code>memory_promote</code>,
   <code>memory_status</code>, and dev-time <code>memory_observe</code> — plus
   <code>memory_confirm</code>, the closing half of every <em>ask</em>), launched per session
-  or connected remotely over streamable HTTP (ADR-0015); platform code uses REST. Everything lives in <strong>one
+  or connected remotely over streamable HTTP (ADR-0015) — where the endpoint is an <strong>OAuth 2.1
+  resource server</strong>, so a client logs the user in at the org's identity provider and the token
+  proves who is acting, and for whom (ADR-0016); platform code uses REST. Everything lives in <strong>one
   Postgres</strong> (+pgvector) so a memory, its provenance, its policy decision, and its audit
   event commit in a single transaction (ADR-0004). Background workers — extraction, the
   <strong>consolidator</strong>, sweeps — produce memory <em>quality</em> offline so the hot path

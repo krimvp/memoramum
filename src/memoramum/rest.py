@@ -3,10 +3,14 @@
 Identity: bearer tokens bound to principals (ADR-0014), configured via
 MEMORAMUM_API_TOKENS ('principal=token', comma-separated). The token
 names the actor; `on_behalf_of` — and the `/v1/context-block` body
-principal, which must match the token — stays caller-asserted. With no
-tokens configured the facade falls back to the dev-mode shim (the caller
-asserts its pair via `X-Memoramum-Actor` / `X-Memoramum-On-Behalf-Of`
-headers), and `main()` refuses to bind beyond loopback.
+principal, which must match the token — stays caller-asserted. The same
+door also accepts the OAuth access tokens the MCP endpoint's
+authorization server issues (ADR-0016): one issuance story for both
+facades, and a user-authorized token proves `on_behalf_of` rather than
+asserting it. With neither configured the facade falls back to the
+dev-mode shim (the caller asserts its pair via `X-Memoramum-Actor` /
+`X-Memoramum-On-Behalf-Of` headers), and `main()` refuses to bind beyond
+loopback.
 """
 
 from __future__ import annotations
@@ -19,8 +23,9 @@ import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from .config import Settings, resolve_bearer_actor, settings_from_env
+from .config import Settings, make_verifier, resolve_credential, settings_from_env
 from .db import make_pool
+from .oauth import AccessTokenVerifier, OAuthError, VerifiedCredential, www_authenticate
 from .principals import Flow, Principal, PrincipalError
 from .service import AccessDenied, MemoryService, NotFound, PolicyUnavailable
 
@@ -141,26 +146,49 @@ class FreezeRequest(BaseModel):
     reason: str = ""
 
 
-def create_app(service: MemoryService | None = None, settings: Settings | None = None) -> FastAPI:
+def create_app(service: MemoryService | None = None, settings: Settings | None = None,
+               verifier: AccessTokenVerifier | None = None) -> FastAPI:
     settings = settings or settings_from_env()
     svc = service or MemoryService(make_pool(settings.database_url), settings)
     app = FastAPI(title="memoramum", version="0.1.0")
 
     api_tokens = settings.api_tokens
+    oauth = settings.oauth
+    verifier = verifier or make_verifier(settings)
 
-    def bearer_actor(authorization: str | None = Header(None)) -> str | None:
-        """The token-bound actor (ADR-0014), or None in dev mode."""
+    def credential(authorization: str | None = Header(None)) -> VerifiedCredential | None:
+        """What the presented credential proved — a static principal-bound
+        token (ADR-0014) or an OAuth access token (ADR-0016) — or None in
+        dev mode."""
         try:
-            return resolve_bearer_actor(api_tokens, authorization)
+            return resolve_credential(api_tokens, verifier, authorization)
+        except OAuthError as e:
+            raise HTTPException(
+                status_code=e.status, detail=str(e),
+                headers={"WWW-Authenticate": www_authenticate(oauth, e.error, str(e))},
+            )
         except LookupError as e:
             raise HTTPException(status_code=401, detail=str(e),
-                                headers={"WWW-Authenticate": "Bearer"})
+                                headers={"WWW-Authenticate": www_authenticate(oauth)})
+
+    def proven_user(cred: VerifiedCredential | None, asserted: str | None) -> str | None:
+        """OAuth proves the delegation a static token can only assert: a
+        header that disagrees with the user who authorized the token is a
+        403, not a quiet override."""
+        if cred and cred.on_behalf_of and asserted and asserted != cred.on_behalf_of:
+            raise HTTPException(
+                status_code=403,
+                detail=f"X-Memoramum-On-Behalf-Of {asserted!r} does not match the user "
+                       "the access token was authorized by",
+            )
+        return (cred.on_behalf_of if cred else None) or asserted
 
     def request_principal(
-        token_actor: str | None = Depends(bearer_actor),
+        cred: VerifiedCredential | None = Depends(credential),
         x_memoramum_actor: str | None = Header(None),
         x_memoramum_on_behalf_of: str | None = Header(None),
     ) -> Principal:
+        token_actor = cred.actor if cred else None
         if token_actor and x_memoramum_actor and x_memoramum_actor != token_actor:
             raise HTTPException(
                 status_code=403,
@@ -171,7 +199,7 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
             raise HTTPException(status_code=401,
                                 detail="no principal: dev mode requires X-Memoramum-Actor")
         try:
-            return Principal(actor, x_memoramum_on_behalf_of)
+            return Principal(actor, proven_user(cred, x_memoramum_on_behalf_of))
         except PrincipalError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -209,10 +237,11 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
     @app.post("/v1/context-block")
     def context_block(
         body: ContextBlockRequest,
-        token_actor: str | None = Depends(bearer_actor),
+        cred: VerifiedCredential | None = Depends(credential),
         x_memoramum_actor: str | None = Header(None),
         x_memoramum_on_behalf_of: str | None = Header(None),
     ):
+        token_actor = cred.actor if cred else None
         if body.principal is not None:
             actor, on_behalf_of = body.principal.agent, body.principal.on_behalf_of
         elif x_memoramum_actor:
@@ -226,7 +255,7 @@ def create_app(service: MemoryService | None = None, settings: Settings | None =
                 status_code=403,
                 detail=f"asserted principal {actor!r} does not match the token's principal",
             )
-        principal = Principal(actor, on_behalf_of)
+        principal = Principal(actor, proven_user(cred, on_behalf_of))
         return svc.context_block(
             principal, body.flow.to_flow(), focus=body.focus, token_budget=body.token_budget
         )
@@ -411,9 +440,11 @@ def main() -> None:
     settings = settings_from_env()
     host = os.environ.get("MEMORAMUM_API_HOST", "127.0.0.1")
     port = int(os.environ.get("MEMORAMUM_API_PORT", "8385"))
-    if not settings.api_tokens and host not in ("127.0.0.1", "::1", "localhost"):
+    authenticated = settings.api_tokens or settings.oauth.enabled
+    if not authenticated and host not in ("127.0.0.1", "::1", "localhost"):
         raise SystemExit(
-            "refusing to bind beyond loopback without MEMORAMUM_API_TOKENS — "
-            "the dev-mode shim trusts asserted principals (ADR-0014)"
+            "refusing to bind beyond loopback without MEMORAMUM_API_TOKENS or "
+            "MEMORAMUM_OAUTH_ISSUER/_RESOURCE — the dev-mode shim trusts asserted "
+            "principals (ADR-0014, ADR-0016)"
         )
     uvicorn.run(create_app(settings=settings), host=host, port=port)

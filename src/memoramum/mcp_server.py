@@ -22,12 +22,27 @@ name raw scope ids — they describe nothing; the launcher already did
     memoramum-mcp
 
 **streamable HTTP** — the central deployment's endpoint: harnesses
-connect remotely instead of spawning anything. The bearer token — the
-same principal-bound MEMORAMUM_API_TOKENS as the REST facade
-(ADR-0014) — names the actor; `on_behalf_of` and the flow ride
-per-request `X-Memoramum-*` headers set by the connecting harness, the
-same trust stdio extends to the launcher's environment. Stateless: any
-replica serves any call.
+connect remotely instead of spawning anything. The credential at the door
+names the actor; the flow rides per-request `X-Memoramum-*` headers set
+by the connecting harness, the same trust stdio extends to the launcher's
+environment. Stateless: any replica serves any call. Two credential kinds
+share the door:
+
+*OAuth 2.1* (ADR-0016) — the endpoint is a resource server: it publishes
+protected-resource metadata (RFC 9728), challenges an anonymous call with
+`401` + a `WWW-Authenticate` pointing at it, and the MCP client logs the
+human in at the deployment's authorization server without being told how.
+A user-authorized token proves `on_behalf_of` instead of asserting it.
+
+    MEMORAMUM_MCP_TRANSPORT=http MEMORAMUM_MCP_HOST=0.0.0.0 \\
+    MEMORAMUM_OAUTH_ISSUER=https://idp.acme.example \\
+    MEMORAMUM_OAUTH_RESOURCE=https://memory.acme.example/mcp \\
+    MEMORAMUM_OAUTH_CLIENT_AGENTS=cli-9f3=agent:sage \\
+    memoramum-mcp
+
+*Static tokens* (ADR-0014) — the same principal-bound
+MEMORAMUM_API_TOKENS as the REST facade, for platform components and
+deployments with no IdP.
 
     MEMORAMUM_MCP_TRANSPORT=http MEMORAMUM_MCP_HOST=0.0.0.0 \\
     MEMORAMUM_API_TOKENS=agent:sage=S3CRET \\
@@ -46,9 +61,20 @@ import psycopg
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from psycopg_pool import PoolTimeout
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
-from .config import Settings, resolve_bearer_actor, settings_from_env
+from .config import Settings, make_verifier, plan_credential, settings_from_env
 from .db import make_pool
+from .oauth import (
+    WELL_KNOWN_RESOURCE,
+    AccessTokenVerifier,
+    OAuthError,
+    OAuthSettings,
+    VerifiedCredential,
+    www_authenticate,
+)
 from .principals import Flow, Principal, PrincipalError
 from .service import MemoryService, PolicyUnavailable
 
@@ -250,16 +276,18 @@ def _split(header: str) -> tuple[str, ...]:
 
 def build_remote_server(service: MemoryService, settings: Settings) -> FastMCP:
     """The streamable-HTTP shape (ADR-0015): one central endpoint, the
-    principal pair and flow resolved per request. The token-bound actor is
-    stashed on the ASGI scope by _BearerAuthMiddleware; `on_behalf_of` and
-    the flow are caller-asserted headers — the same trust stdio extends to
-    the launcher's environment variables."""
+    principal pair and flow resolved per request. What the credential
+    proved is stashed on the ASGI scope by _BearerAuthMiddleware: always
+    the actor, and — for a user-authorized OAuth token (ADR-0016) —
+    `on_behalf_of` too. Anything the credential did not prove stays a
+    caller-asserted header, the same trust stdio extends to the launcher's
+    environment variables."""
     if settings.mcp_allowed_hosts:
         security = TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=list(settings.mcp_allowed_hosts),
         )
-    elif settings.api_tokens:
+    elif settings.api_tokens or settings.oauth.enabled:
         # Rebinding needs a browser to relay calls, and a browser cannot
         # attach the bearer token; Host stays the deployment edge's concern.
         security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
@@ -272,7 +300,8 @@ def build_remote_server(service: MemoryService, settings: Settings) -> FastMCP:
         if request is None:
             raise PrincipalError("no HTTP request context to resolve a principal from")
         headers = request.headers
-        token_actor = request.scope.get("memoramum.actor")
+        credential: VerifiedCredential | None = request.scope.get("memoramum.credential")
+        token_actor = credential.actor if credential else None
         asserted = headers.get("x-memoramum-actor")
         if token_actor and asserted and asserted != token_actor:
             raise PrincipalError(
@@ -281,7 +310,14 @@ def build_remote_server(service: MemoryService, settings: Settings) -> FastMCP:
         actor = token_actor or asserted
         if actor is None:
             raise PrincipalError("no principal: dev mode requires X-Memoramum-Actor")
-        principal = Principal(actor, headers.get("x-memoramum-on-behalf-of") or None)
+        asserted_user = headers.get("x-memoramum-on-behalf-of") or None
+        proven_user = credential.on_behalf_of if credential else None
+        if proven_user and asserted_user and asserted_user != proven_user:
+            raise PrincipalError(
+                f"X-Memoramum-On-Behalf-Of {asserted_user!r} does not match the "
+                f"user the access token was authorized by"
+            )
+        principal = Principal(actor, proven_user or asserted_user)
         flow = Flow(
             surface=headers.get("x-memoramum-surface"),
             container=headers.get("x-memoramum-container"),
@@ -296,51 +332,94 @@ def build_remote_server(service: MemoryService, settings: Settings) -> FastMCP:
     return mcp
 
 
-class _BearerAuthMiddleware:
-    """ADR-0014 at the MCP door: a missing or unknown bearer token is
-    refused with HTTP 401 before any JSON-RPC processing; the token-bound
-    actor rides the ASGI scope so per-call resolution never re-derives
-    identity from a raw credential. With no tokens configured this is a
-    pass-through — the dev-mode header shim applies (loopback only)."""
+def _metadata_routes(oauth: OAuthSettings) -> list[Route]:
+    """RFC 9728 discovery: the document a challenged MCP client fetches to
+    learn which authorization server to log in at (ADR-0016). Public by
+    definition — the door below lets it through unauthenticated — and
+    served at both the path-inserted URL (§3.1, what the challenge points
+    at) and the bare well-known path older clients try first."""
+    document = oauth.metadata()
 
-    def __init__(self, app, api_tokens: tuple[tuple[str, str], ...]):
+    async def metadata(request: Request) -> JSONResponse:
+        return JSONResponse(document, headers={"Access-Control-Allow-Origin": "*"})
+
+    paths = [oauth.metadata_path]
+    if oauth.metadata_path != WELL_KNOWN_RESOURCE:
+        paths.append(WELL_KNOWN_RESOURCE)
+    return [Route(p, endpoint=metadata, methods=["GET", "OPTIONS"]) for p in paths]
+
+
+class _BearerAuthMiddleware:
+    """The MCP door: a missing, malformed, or unknown credential is
+    refused with HTTP 401 before any JSON-RPC processing, and what the
+    credential proved rides the ASGI scope so per-call resolution never
+    re-derives identity from a raw secret. Both credential kinds land
+    here — an OAuth access token (ADR-0016), whose challenge names the
+    authorization server to log in at, and a static principal-bound token
+    (ADR-0014). With neither configured this is a pass-through — the
+    dev-mode header shim applies (loopback only)."""
+
+    def __init__(self, app, api_tokens: tuple[tuple[str, str], ...],
+                 oauth: OAuthSettings | None = None,
+                 verifier: AccessTokenVerifier | None = None):
         self.app = app
         self.api_tokens = api_tokens
+        self.oauth = oauth
+        self.verifier = verifier
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not self.api_tokens:
+        if scope["type"] != "http" or (not self.api_tokens and self.verifier is None):
             return await self.app(scope, receive, send)
+        if scope.get("path", "").startswith(WELL_KNOWN_RESOURCE):
+            return await self.app(scope, receive, send)   # discovery is public
         authorization = ""
         for name, value in scope.get("headers", []):
             if name == b"authorization":
                 authorization = value.decode("latin-1")
         try:
-            actor = resolve_bearer_actor(self.api_tokens, authorization)
+            credential = await self._resolve(authorization)
+        except OAuthError as e:
+            return await self._refuse(send, str(e), error=e.error, status=e.status)
         except LookupError as e:
             return await self._refuse(send, str(e))
         scope = dict(scope)
-        scope["memoramum.actor"] = actor
+        scope["memoramum.credential"] = credential
+        scope["memoramum.actor"] = credential.actor
         await self.app(scope, receive, send)
 
-    @staticmethod
-    async def _refuse(send, detail: str) -> None:
+    async def _resolve(self, authorization: str) -> VerifiedCredential:
+        resolved, token = plan_credential(self.api_tokens, self.verifier, authorization)
+        if token:
+            return await self.verifier.averify(token)
+        assert resolved is not None    # a configured door always resolves or raises
+        return resolved
+
+    async def _refuse(self, send, detail: str, error: str = "invalid_token",
+                      status: int = 401) -> None:
         body = json.dumps({"detail": detail}).encode()
+        challenge = www_authenticate(self.oauth, error, detail).encode()
         await send({
-            "type": "http.response.start", "status": 401,
+            "type": "http.response.start", "status": status,
             "headers": [(b"content-type", b"application/json"),
-                        (b"www-authenticate", b"Bearer"),
+                        (b"www-authenticate", challenge),
                         (b"content-length", str(len(body)).encode())],
         })
         await send({"type": "http.response.body", "body": body})
 
 
-def create_mcp_app(service: MemoryService | None = None, settings: Settings | None = None):
-    """The remote facade as an ASGI app (mounted at /mcp), auth included."""
+def create_mcp_app(service: MemoryService | None = None, settings: Settings | None = None,
+                   verifier: AccessTokenVerifier | None = None):
+    """The remote facade as an ASGI app (mounted at /mcp), auth included:
+    the OAuth discovery routes (ADR-0016) in front, the credential door
+    around everything else."""
     settings = settings or settings_from_env()
     svc = service or MemoryService(make_pool(settings.database_url), settings)
-    return _BearerAuthMiddleware(
-        build_remote_server(svc, settings).streamable_http_app(), settings.api_tokens
-    )
+    oauth = settings.oauth
+    verifier = verifier or make_verifier(settings)
+    app = build_remote_server(svc, settings).streamable_http_app()
+    if oauth.enabled:
+        app.router.routes[:0] = _metadata_routes(oauth)
+    return _BearerAuthMiddleware(app, settings.api_tokens, oauth, verifier)
 
 
 def main() -> None:
@@ -352,10 +431,12 @@ def main() -> None:
 
         host = os.environ.get("MEMORAMUM_MCP_HOST", "127.0.0.1")
         port = int(os.environ.get("MEMORAMUM_MCP_PORT", "8386"))
-        if not settings.api_tokens and host not in ("127.0.0.1", "::1", "localhost"):
+        authenticated = settings.api_tokens or settings.oauth.enabled
+        if not authenticated and host not in ("127.0.0.1", "::1", "localhost"):
             raise SystemExit(
-                "refusing to bind beyond loopback without MEMORAMUM_API_TOKENS — "
-                "the dev-mode shim trusts asserted principals (ADR-0014, ADR-0015)"
+                "refusing to bind beyond loopback without MEMORAMUM_API_TOKENS or "
+                "MEMORAMUM_OAUTH_ISSUER/_RESOURCE — the dev-mode shim trusts asserted "
+                "principals (ADR-0014, ADR-0015, ADR-0016)"
             )
         uvicorn.run(create_mcp_app(settings=settings), host=host, port=port)
         return
