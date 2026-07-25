@@ -24,9 +24,14 @@ name raw scope ids — they describe nothing; the launcher already did
 **streamable HTTP** — the central deployment's endpoint: harnesses
 connect remotely instead of spawning anything. The credential at the door
 names the actor; the flow rides per-request `X-Memoramum-*` headers set
-by the connecting harness, the same trust stdio extends to the launcher's
-environment. Stateless: any replica serves any call. Two credential kinds
-share the door:
+by the connecting harness — or the connect URL's query string, for a
+client whose whole configuration is a URL (ADR-0017) — the same trust
+stdio extends to the launcher's environment. Stateless: any replica
+serves any call.
+
+    https://memory.acme.example/mcp?surface=ide&project=project/platform-api
+
+Two credential kinds share the door:
 
 *OAuth 2.1* (ADR-0016) — the endpoint is a resource server: it publishes
 protected-resource metadata (RFC 9728), challenges an anonymous call with
@@ -264,8 +269,11 @@ def _register(mcp: FastMCP, service: MemoryService, resolve: Resolver) -> None:
 
 
 def build_server(service: MemoryService, principal: Principal, flow: Flow) -> FastMCP:
-    """The stdio shape: one server, one session context (ADR-0005)."""
-    mcp = FastMCP("memoramum")
+    """The stdio shape: one server, one session context (ADR-0005). The
+    prompt contract (doc 04 §4) ships as the server's `instructions` as
+    well as a prompt, so a client that reads neither still receives it on
+    initialize — the contract only works if the agent sees it."""
+    mcp = FastMCP("memoramum", instructions=PROMPT_CONTRACT)
     _register(mcp, service, lambda: (principal, flow))
     return mcp
 
@@ -293,24 +301,37 @@ def build_remote_server(service: MemoryService, settings: Settings) -> FastMCP:
         security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
     else:
         security = None    # dev-mode shim: the SDK's loopback-only default
-    mcp = FastMCP("memoramum", stateless_http=True, transport_security=security)
+    mcp = FastMCP("memoramum", instructions=PROMPT_CONTRACT, stateless_http=True,
+                  transport_security=security)
 
     def resolve() -> tuple[Principal, Flow]:
         request = mcp.get_context().request_context.request
         if request is None:
             raise PrincipalError("no HTTP request context to resolve a principal from")
         headers = request.headers
+        query = request.query_params
+
+        def stated(field: str, header: str) -> str:
+            """A flow field as this call states it: the per-request header
+            where the harness can set one, else the connect URL's query
+            string — the only channel every MCP client has (ADR-0017).
+            Same assertion, two carriers; the header is the live one, so
+            it wins."""
+            return headers.get(header) or query.get(field, "")
+
         credential: VerifiedCredential | None = request.scope.get("memoramum.credential")
         token_actor = credential.actor if credential else None
-        asserted = headers.get("x-memoramum-actor")
+        asserted = stated("actor", "x-memoramum-actor") or None
         if token_actor and asserted and asserted != token_actor:
             raise PrincipalError(
                 f"X-Memoramum-Actor {asserted!r} does not match the token's principal"
             )
         actor = token_actor or asserted
         if actor is None:
-            raise PrincipalError("no principal: dev mode requires X-Memoramum-Actor")
-        asserted_user = headers.get("x-memoramum-on-behalf-of") or None
+            raise PrincipalError(
+                "no principal: dev mode requires X-Memoramum-Actor (or ?actor= on the URL)"
+            )
+        asserted_user = stated("on_behalf_of", "x-memoramum-on-behalf-of") or None
         proven_user = credential.on_behalf_of if credential else None
         if proven_user and asserted_user and asserted_user != proven_user:
             raise PrincipalError(
@@ -319,12 +340,12 @@ def build_remote_server(service: MemoryService, settings: Settings) -> FastMCP:
             )
         principal = Principal(actor, proven_user or asserted_user)
         flow = Flow(
-            surface=headers.get("x-memoramum-surface"),
-            container=headers.get("x-memoramum-container"),
-            participants=_split(headers.get("x-memoramum-participants", "")),
-            session_id=headers.get("x-memoramum-session"),
-            project=headers.get("x-memoramum-project") or None,
-            touched_paths=_split(headers.get("x-memoramum-touched-paths", "")),
+            surface=stated("surface", "x-memoramum-surface") or None,
+            container=stated("container", "x-memoramum-container") or None,
+            participants=_split(stated("participants", "x-memoramum-participants")),
+            session_id=stated("session", "x-memoramum-session") or None,
+            project=stated("project", "x-memoramum-project") or None,
+            touched_paths=_split(stated("paths", "x-memoramum-touched-paths")),
         )
         return principal, flow
 
@@ -407,11 +428,51 @@ class _BearerAuthMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
+class _CorsMiddleware:
+    """Browser-hosted MCP clients can only follow the ADR-0016 login if
+    they can read the challenge: `WWW-Authenticate` is invisible to fetch()
+    unless exposed, and the preflight has to pass before the 401 is ever
+    seen. Applied only when a credential door is configured — in dev mode
+    the shim trusts asserted principals, and no web page should be able to
+    reach it from the user's browser."""
+
+    HEADERS = (
+        (b"access-control-allow-origin", b"*"),
+        (b"access-control-expose-headers", b"WWW-Authenticate, Mcp-Session-Id, Mcp-Protocol-Version"),
+    )
+    PREFLIGHT = HEADERS + (
+        (b"access-control-allow-methods", b"GET, POST, DELETE, OPTIONS"),
+        (b"access-control-allow-headers",
+         b"Authorization, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID"),
+        (b"access-control-max-age", b"86400"),
+    )
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        if scope.get("method") == "OPTIONS":
+            await send({"type": "http.response.start", "status": 204,
+                        "headers": [*self.PREFLIGHT, (b"content-length", b"0")]})
+            return await send({"type": "http.response.body", "body": b""})
+
+        async def with_cors(message):
+            if message["type"] == "http.response.start":
+                message = dict(message)
+                message["headers"] = [*message.get("headers", []), *self.HEADERS]
+            await send(message)
+
+        await self.app(scope, receive, with_cors)
+
+
 def create_mcp_app(service: MemoryService | None = None, settings: Settings | None = None,
                    verifier: AccessTokenVerifier | None = None):
     """The remote facade as an ASGI app (mounted at /mcp), auth included:
     the OAuth discovery routes (ADR-0016) in front, the credential door
-    around everything else."""
+    around everything else, CORS outermost so a browser client can see
+    the challenge it must answer."""
     settings = settings or settings_from_env()
     svc = service or MemoryService(make_pool(settings.database_url), settings)
     oauth = settings.oauth
@@ -419,7 +480,8 @@ def create_mcp_app(service: MemoryService | None = None, settings: Settings | No
     app = build_remote_server(svc, settings).streamable_http_app()
     if oauth.enabled:
         app.router.routes[:0] = _metadata_routes(oauth)
-    return _BearerAuthMiddleware(app, settings.api_tokens, oauth, verifier)
+    door = _BearerAuthMiddleware(app, settings.api_tokens, oauth, verifier)
+    return _CorsMiddleware(door) if (settings.api_tokens or verifier) else door
 
 
 def main() -> None:

@@ -49,9 +49,9 @@ def dev_client(svc):
         yield c
 
 
-def _rpc(client, method, params, headers=None):
+def _rpc(client, method, params, headers=None, path="/mcp"):
     resp = client.post(
-        "/mcp",
+        path,
         json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
         headers={**MCP_HEADERS, **(headers or {})},
     )
@@ -63,9 +63,9 @@ def _rpc(client, method, params, headers=None):
     return json.loads(data[-1])
 
 
-def _call(client, tool, arguments, headers=None):
+def _call(client, tool, arguments, headers=None, path="/mcp"):
     """Returns (payload, error_text): error_text is None on success."""
-    reply = _rpc(client, "tools/call", {"name": tool, "arguments": arguments}, headers)
+    reply = _rpc(client, "tools/call", {"name": tool, "arguments": arguments}, headers, path)
     result = reply["result"]
     if result.get("isError"):
         return None, result["content"][0]["text"]
@@ -133,3 +133,64 @@ def test_dev_mode_header_shim(dev_client):
 
     _, err = _call(dev_client, "memory_recall", {"query": "deploy freeze"}, FLOW_HEADERS)
     assert err is not None and "dev mode requires X-Memoramum-Actor" in err
+
+
+# -- the connect URL as the flow carrier (ADR-0017) ----------------------
+
+# What a client that can only be handed a URL connects with: the flow the
+# harness would otherwise set in X-Memoramum-* headers, stated once.
+CONNECT_URL = ("/mcp?surface=slack&container=channel/C0DEP"
+               "&participants=user:dana,user:li&session=sess-url"
+               "&on_behalf_of=user:dana")
+
+
+def test_connect_url_states_the_flow(client, svc):
+    verdict, err = _call(client, "memory_remember", {
+        "content": "The staging deploy window is Tuesday mornings",
+        "kind": "semantic",
+        "origin_kind": "explicit_user_ask",
+        "justification": "dana asked to keep this",
+    }, AUTH, path=CONNECT_URL)
+    assert err is None
+    assert verdict["decision"] == "allow"
+
+    # Routed by the URL's container, attributed to the URL's user — with
+    # not one X-Memoramum-* header on the request.
+    events = svc.audit_events(ADMIN, memory_id=verdict["memory_id"])
+    assert any(e["scope_id"] == "channel/C0DEP" for e in events)
+    assert any(e["on_behalf_of"] == "user:dana" for e in events)
+
+    # Shared world: an active memory here competes in every later recall.
+    from conftest import DANA, DEPLOYS_FLOW
+    svc.forget(DANA, DEPLOYS_FLOW, memory_id=verdict["memory_id"],
+               reason="connect-url fixture cleanup")
+
+
+def test_headers_win_over_the_connect_url(dev_client):
+    # The URL is stated once at connect time; a header is stated per call,
+    # so the header is the live one.
+    payload, err = _call(dev_client, "memory_recall", {"query": "deploy freeze"},
+                         {"x-memoramum-actor": "agent:sage"},
+                         path="/mcp?actor=agent:nonexistent&surface=slack")
+    assert err is None and isinstance(payload, list)
+
+
+def test_connect_url_alone_names_the_dev_mode_principal(dev_client):
+    payload, err = _call(dev_client, "memory_recall", {"query": "deploy freeze"},
+                         path="/mcp?actor=agent:sage&surface=slack&container=channel/C0DEP")
+    assert err is None and isinstance(payload, list)
+
+
+def test_prompt_contract_ships_as_server_instructions(client):
+    reply = _rpc(client, "initialize", {
+        "protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"},
+    }, AUTH)
+    instructions = reply["result"]["instructions"]
+    assert "Remember when" in instructions and "Recall when" in instructions
+
+
+def test_dev_mode_stays_closed_to_browsers(dev_client):
+    # No credential door: no CORS, so a web page cannot reach the shim.
+    resp = dev_client.options("/mcp")
+    assert "access-control-allow-origin" not in resp.headers

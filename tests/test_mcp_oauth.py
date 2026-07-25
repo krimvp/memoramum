@@ -323,3 +323,18 @@ def test_rest_accepts_the_same_access_token(svc, settings):
     # user:admin is (conftest seed), reached here through an IdP-named actor.
     admin = mint(memoramum_actor="user:admin", sub="admin")
     assert rest.get("/v1/metrics", headers=auth(admin)).status_code == 200
+
+
+# -- browser-hosted clients ---------------------------------------------
+
+def test_preflight_and_challenge_are_readable_cross_origin(client):
+    preflight = client.options("/mcp", headers={"origin": "https://client.example",
+                                                "access-control-request-method": "POST"})
+    assert preflight.status_code == 204
+    assert preflight.headers["access-control-allow-origin"] == "*"
+    assert "Authorization" in preflight.headers["access-control-allow-headers"]
+
+    # The 401 is only useful if fetch() can read the challenge off it.
+    challenged = _post(client, {})
+    assert challenged.status_code == 401
+    assert "WWW-Authenticate" in challenged.headers["access-control-expose-headers"]

@@ -54,6 +54,42 @@ make consolidate # one consolidator run (the doc 07 §2 job set); nightly in pro
 make extract     # one extraction-worker pass (doc 07 §1); scheduled in production
 ```
 
+### Connecting a client
+
+Run the agent facade over HTTP as an OAuth resource server ([ADR-0016](docs/adr/0016-oauth-resource-server.md)) — the deployment names one authorization server, and this endpoint's public URL is both the resource clients request tokens for and the base of its discovery document:
+
+```bash
+MEMORAMUM_MCP_TRANSPORT=http MEMORAMUM_MCP_HOST=0.0.0.0 \
+MEMORAMUM_OAUTH_ISSUER=https://idp.acme.example \
+MEMORAMUM_OAUTH_RESOURCE=https://memory.acme.example/mcp \
+MEMORAMUM_OAUTH_SCOPES=memoramum.mcp \
+MEMORAMUM_OAUTH_CLIENT_AGENTS=cli-9f3=agent:sage \
+memoramum-mcp
+```
+
+Then a client needs the URL and nothing else — no pre-shared secret. It gets `401` with `WWW-Authenticate: Bearer resource_metadata="…"`, follows it to the authorization server, and logs the human in:
+
+```bash
+claude mcp add --transport http memoramum \
+  'https://memory.acme.example/mcp?surface=ide&project=project/platform-api'
+```
+
+The query string is the flow context ([ADR-0017](docs/adr/0017-connect-url-flow-context.md)) — `surface`, `container`, `participants`, `session`, `project`, `paths` — for clients whose whole configuration is a URL; a harness that can set `X-Memoramum-*` headers per call overrides it. `on_behalf_of` needs neither carrier once the login proves it.
+
+Deployments without an identity provider keep principal-bound bearer tokens ([ADR-0014](docs/adr/0014-bearer-token-rest-auth.md)) at the same door — `MEMORAMUM_API_TOKENS=agent:sage=S3CRET`, and the client sends `Authorization: Bearer S3CRET`. With neither configured the facade runs the dev-mode shim, which refuses to bind beyond loopback:
+
+```bash
+MEMORAMUM_MCP_TRANSPORT=http memoramum-mcp   # then connect to
+# http://127.0.0.1:8386/mcp?actor=agent:sage&surface=ide&project=project/platform-api
+```
+
+Verify a deployment from the outside — the challenge, then what it points at:
+
+```bash
+curl -i -X POST https://memory.acme.example/mcp -d '{}'
+curl https://memory.acme.example/.well-known/oauth-protected-resource/mcp
+```
+
 ## Glossary
 
 The terms below are used consistently across all documents.

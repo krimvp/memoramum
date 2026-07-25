@@ -43,7 +43,7 @@ docs/
                               PII pipeline
   07-operations.md            components, consolidator jobs, reference stack, SLOs, rollout
   appendix-prior-art.md       survey of Letta, Mem0, Zep/Graphiti, LangMem, etc.
-  adr/000N-*.md               one-page records of the contested decisions (16 so far)
+  adr/000N-*.md               one-page records of the contested decisions (17 so far)
 ```
 
 Read `README.md` first, then docs in numeric order — each ends with a "Continue with"
