@@ -77,9 +77,11 @@ rephrase to evade; relay `ask` questions verbatim; never claim to have
 remembered or forgotten something unless the tool confirmed it; prefer
 citing provenance for memory-derived claims ("per @dana in #deploys in
 March"); treat [staged] items as hypotheses — verify before acting on them
-in consequential ways; if a tool returns `unavailable`, say "I can't check
-my memory right now" — don't guess, and don't claim memory you couldn't
-reach.
+in consequential ways; an empty memory_recall means nothing relevant is
+stored, not that retrieval failed — say so and move on, the service returns
+no rows rather than the least-bad ones; if a tool returns `unavailable`, say
+"I can't check my memory right now" — don't guess, and don't claim memory
+you couldn't reach.
 """
 
 # (Principal, Flow) per call: constant in stdio mode, request-derived in
@@ -140,7 +142,8 @@ def _register(mcp: FastMCP, service: MemoryService, resolve: Resolver) -> None:
     ) -> list[dict] | dict:
         """Search memory mid-task (deliberate recall). Use before answering
         anything about a person, team, process, or past decision. Each result
-        carries a provenance hint — weigh it, and cite it where useful."""
+        carries a provenance hint — weigh it, and cite it where useful. An
+        empty list is a real answer: nothing relevant is stored."""
         principal, flow = resolve()
         return service.recall(
             principal, flow, query=query, kinds=kinds, subjects=subjects,

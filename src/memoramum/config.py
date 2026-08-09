@@ -149,12 +149,21 @@ class Settings:
     decay_archive_grace_days: float = 7.0    # candidates archive on a later run (visibility first)
     history_retention_days: int = 365        # deprecated older than this → archive
 
-    # Retrieval scoring knobs, doc 04 §3 defaults. The policy engine (P3)
-    # tunes the read-side gates per agent (trust floor, sensitivity
-    # ceiling, staged inclusion, category deny-lists — doc 05 §4.2); the
-    # score weights themselves stay global defaults.
+    # Retrieval scoring knobs, doc 04 §3 defaults. The policy engine tunes
+    # both halves of the read policy per agent: the gates (trust floor,
+    # sensitivity ceiling, staged inclusion, category deny-lists — doc 05
+    # §4.2) and the score-factor exponents (ADR-0018), which fall back to
+    # `score_weights` below when no layer sets them.
     status_weights: dict = field(
         default_factory=lambda: {"invariant": 1.2, "active": 1.0, "staged": 0.6}
+    )
+    # Exponents on the five doc 04 §3 factors: 0 disables a factor, 1 is
+    # the documented default, >1 sharpens it (ADR-0018).
+    score_weights: dict = field(
+        default_factory=lambda: {
+            "relevance": 1.0, "retention": 1.0, "trust": 1.0,
+            "status": 1.0, "scope_proximity": 1.0,
+        }
     )
     # Base decay time constant in days per unit of strength (doc 03 §5 gives
     # the curve R = exp(-t/S) and the kind ratios; the base constant is an
@@ -168,6 +177,27 @@ class Settings:
     scope_proximity_base: float = 0.9
     # Retrieval trust floor when no policy supplies one (doc 05 §4.2).
     default_trust_floor: float = 0.3
+
+    # Per-leg admission gates (ADR-0016). These bound what counts as
+    # relevant at all, so they are properties of the embedding space and of
+    # the deployment — not per-agent weights.
+    #
+    # Cosine distance beyond which a vector neighbour is not a candidate.
+    # Like `outlier_distance` above, the default is calibrated for the dev
+    # hash embedder, whose vectors are near-orthogonal noise; a real model
+    # embedder clusters far tighter and wants roughly 0.4–0.6.
+    vector_distance_ceiling: float = 0.85
+    # pg_trgm word similarity a query must reach against its best-matching
+    # extent of a memory's content to enter the literal leg (ADR-0017).
+    # Postgres' own default for `<%` is 0.6; long prose queries essentially
+    # never clear it, which is what keeps the leg identifier-shaped.
+    word_similarity_threshold: float = 0.6
+    # HNSW search breadth for the vector leg. Retrieval always filters
+    # (scope chain, status, trust floor) and HNSW filters after the index
+    # walk, so the default ef_search of 40 can under-return on a selective
+    # chain (doc 07 §3). Iterative scans are used on top where the pgvector
+    # build offers them.
+    hnsw_ef_search: int = 200
     # Hash-chain the event log for these scope families (doc 02 §5).
     hash_chain_families: frozenset = frozenset({"subject"})
     # Context-block budget is in tokens; we approximate tokens as chars/4.

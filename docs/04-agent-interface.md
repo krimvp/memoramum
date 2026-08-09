@@ -139,20 +139,25 @@ The two paths are complementary, per the LangMem hot-path/background framing: am
 Generative-Agents-shaped composite over hybrid candidates:
 
 ```
-candidates = top-K by hybrid relevance
-             (vector cosine over content_embedding  ⊕  BM25/tsvector lexical, RRF-fused)
-             within permitted scope chain, status ∈ {active, invariant, staged*}
+candidates = RRF fusion of three legs, each admitting only what clears its own
+             absolute gate, within permitted scope chain,
+             status ∈ {active, invariant, staged*}:
 
-score(m) = w_rel · relevance(m)          # normalized hybrid score
-         × R(m)                          # retention exp(-t/S) — recency/decay (doc 03 §5)
-         × trust_weight(m)               # trust_score, floored by read-context policy
-         × status_weight(m)              # invariant 1.2 · active 1.0 · staged 0.6
-         × scope_proximity(m)            # narrower scope in chain ranks above broader (channel beats org)
+   lexical   tsvector @@ websearch_to_tsquery('english', q)   -- stemmed prose
+   vector    content_embedding <=> embed(q)                   -- within a distance ceiling
+   literal   q <% content  (pg_trgm word similarity)          -- paths, symbols, ids
+
+score(m) = relevance(m)^w_rel            # normalized RRF fusion of the legs above
+         × R(m)^w_ret                    # retention exp(-t/S) — recency/decay (doc 03 §5)
+         × trust_score(m)^w_trust        # provenance-derived, floored by read-context policy
+         × status_weight(m)^w_status     # invariant 1.2 · active 1.0 · staged 0.6
+         × scope_proximity(m)^w_prox     # narrower scope in chain ranks above broader (channel beats org)
 ```
 
-- Lexical search is a first-class leg, not an afterthought — exact tokens (team names, service names, MR numbers) are where pure-vector recall fails.
+- **Lexical search is a first-class leg, not an afterthought** — exact tokens (team names, service names, MR numbers) are where pure-vector recall fails. The *literal* leg carries this further than a stemmed index can: `payments/ledger.py` and `PaymentLedger` are single lexemes to the `english` parser, and a codebase convention is a statement about exactly such tokens ([ADR-0017](adr/0017-literal-retrieval-leg.md)).
+- **Each leg gates on absolute relevance before fusion** ([ADR-0016](adr/0016-absolute-relevance-admission.md)). RRF ranks candidates; it cannot say "no", and normalizing by the best hit would make the top result perfectly relevant by construction. So the vector leg admits only neighbours inside a cosine-distance ceiling, the literal leg only extents above a word-similarity threshold, and the lexical leg only genuine `tsquery` matches. **A focused read that admits nothing returns nothing** — the empty answer is what lets a compliant agent say "I have nothing on that" instead of citing the least-bad row. Only an ambient block *without* a focus (§2.1) falls back to recency ordering, where there is no relevance question to answer.
 - `scope_proximity` encodes "the channel's own memory beats the org-wide default" — specific context wins over general.
-- All weights are policy-tunable per agent; defaults above.
+- **The weights are exponents and are policy-tunable per agent** ([ADR-0018](adr/0018-retrieval-weights-are-policy.md), [doc 05 §4.2](05-policy.md)): `0` disables a factor, `1` is the default above, `> 1` sharpens it. A coefficient would be a no-op — every candidate carries the same factors, so scaling one reorders nothing. The distance ceiling and similarity threshold are *not* weights: they are properties of the embedding space and of the deployment, not of an agent.
 - Retrieval never *mutates* trust/confidence; it updates `last_accessed_at`/`access_count` and emits `READ`.
 
 Access control is applied **before** scoring (scope-chain intersection + attribute rules, [doc 05 §4](05-policy.md)) — never post-filtering an over-fetched candidate set, which both starves top-k and leaks via timing.
@@ -183,6 +188,7 @@ Shipped with the MCP server as a system-prompt snippet; per-agent policy can ext
 - never claim to have remembered or forgotten something unless the tool confirmed it;
 - prefer citing provenance for memory-derived claims ("per @dana in #deploys in March");
 - treat `[staged]` items as hypotheses: verify before acting on them in consequential ways;
+- an empty `memory_recall` means *nothing relevant is stored*, not that retrieval failed — say so plainly and move on; the service returns no rows rather than the least-bad ones ([ADR-0016](adr/0016-absolute-relevance-admission.md));
 - if a tool returns `unavailable`, say "I can't check my memory right now" — don't guess, and don't claim memory you couldn't reach ([doc 07 §5](07-operations.md)).
 
 The contract is persuasive; the *enforcement* is server-side policy ([doc 05](05-policy.md)) — the design assumes agents will sometimes ignore instructions, and nothing in the security model depends on them not doing so.
