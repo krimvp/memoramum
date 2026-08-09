@@ -32,6 +32,16 @@ _SENSITIVITY_RANK = {s: i for i, s in enumerate(SENSITIVITIES)}
 ROUTES = ("source", "subject", "module", "agent")
 CONFIRMERS = ("flow_user", "scope_member", "subject", "module_owner", "maintainer")
 
+# The two halves of a `read:` section (doc 05 §4.2). The first four are
+# *gates* — they decide what may be retrieved at all, and compose
+# strictest-wins like every other axis. `weights` are the doc 04 §3 score
+# exponents, which only reorder what the gates permitted and compose by
+# narrowest-setter-wins under an org pin (ADR-0018).
+_READ_GATES = ("include_staged", "trust_floor", "sensitivity_ceiling", "deny_categories")
+_READ_KEYS = {*_READ_GATES, "weights"}
+SCORE_WEIGHTS = ("relevance", "retention", "trust", "status", "scope_proximity")
+MAX_SCORE_WEIGHT = 5.0
+
 
 class PolicyError(ValueError):
     pass
@@ -306,8 +316,19 @@ def parse_document(document) -> dict:
     read = doc.get("read") or {}
     if "sensitivity_ceiling" in read:
         sensitivity_rank(read["sensitivity_ceiling"])
-    if not set(read) <= {"include_staged", "trust_floor", "sensitivity_ceiling", "deny_categories"}:
-        raise PolicyError(f"unknown read-policy keys {sorted(set(read) - {'include_staged', 'trust_floor', 'sensitivity_ceiling', 'deny_categories'})}")
+    if not set(read) <= _READ_KEYS:
+        raise PolicyError(f"unknown read-policy keys {sorted(set(read) - _READ_KEYS)}")
+    for key, value in (read.get("weights") or {}).items():
+        if key not in SCORE_WEIGHTS:
+            raise PolicyError(
+                f"unknown retrieval weight {key!r} (expected {sorted(SCORE_WEIGHTS)})"
+            )
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise PolicyError(f"retrieval weight {key!r} must be a number")
+        if not 0.0 <= float(value) <= MAX_SCORE_WEIGHT:
+            raise PolicyError(
+                f"retrieval weight {key!r} must be within [0, {MAX_SCORE_WEIGHT}]"
+            )
     if read:
         canonical["read"] = read
     return canonical
@@ -465,16 +486,33 @@ class ReadPolicy:
     trust_floor: float | None = None            # None → the settings default
     sensitivity_ceiling: str = "restricted"     # no ceiling
     deny_categories: tuple[str, ...] = ()
+    # doc 04 §3 score exponents; only the keys some layer set — the rest
+    # fall through to the deployment defaults (Settings.score_weights).
+    weights: tuple[tuple[str, float], ...] = ()
+
+    def weight_map(self) -> dict[str, float]:
+        return dict(self.weights)
 
 
 def read_policy(layers: list[PolicyLayer]) -> ReadPolicy:
-    """Merge the layers' `read:` sections, strictest-wins: staged excluded
-    if any layer excludes it, the highest trust floor, the lowest
-    sensitivity ceiling, the union of category deny-lists."""
+    """Merge the layers' `read:` sections (doc 05 §4.2).
+
+    The four *gates* compose strictest-wins: staged excluded if any layer
+    excludes it, the highest trust floor, the lowest sensitivity ceiling,
+    the union of category deny-lists.
+
+    The `weights` compose differently, because "strictest" is undefined for
+    a tuning exponent that cannot widen a read (ADR-0018): the org layer's
+    weights are final, and below org the narrowest layer that sets a weight
+    wins — layers arrive broadest-first, so a later setter simply overwrites
+    an earlier one unless org already pinned that key.
+    """
     include_staged = True
     floor: float | None = None
     ceiling = "restricted"
     deny: list[str] = []
+    weights: dict[str, float] = {}
+    org_pinned: set[str] = set()
     for layer in layers:
         r = layer.read
         if r.get("include_staged") is False:
@@ -485,7 +523,14 @@ def read_policy(layers: list[PolicyLayer]) -> ReadPolicy:
             if sensitivity_rank(r["sensitivity_ceiling"]) < sensitivity_rank(ceiling):
                 ceiling = r["sensitivity_ceiling"]
         deny += [c for c in r.get("deny_categories", ()) if c not in deny]
-    return ReadPolicy(include_staged, floor, ceiling, tuple(deny))
+        for key, value in (r.get("weights") or {}).items():
+            if key in org_pinned:
+                continue
+            weights[key] = float(value)
+            if layer.name == "org":
+                org_pinned.add(key)
+    return ReadPolicy(include_staged, floor, ceiling, tuple(deny),
+                      tuple(sorted(weights.items())))
 
 
 # ---------- retention overrides (doc 05 §1 `retention:`) ----------

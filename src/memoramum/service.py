@@ -1407,7 +1407,7 @@ class MemoryService:
                 kinds=kinds, subjects=subjects,
                 include_staged=include_staged and rp.include_staged,
                 trust_floor=rp.trust_floor, sensitivity_ceiling=rp.sensitivity_ceiling,
-                deny_categories=list(rp.deny_categories),
+                deny_categories=list(rp.deny_categories), weights=rp.weight_map(),
                 as_of=as_of, limit=limit,
             )
             self._deliver(cur, principal, flow, [str(h["id"]) for h in hits],
@@ -1424,14 +1424,24 @@ class MemoryService:
             cur = conn.cursor()
             chain = scopes.resolve_chain(cur, principal, flow)
             chain, rp, noted = self._degraded_read(cur, principal, flow, chain)
+            gates = dict(
+                trust_floor=rp.trust_floor, sensitivity_ceiling=rp.sensitivity_ceiling,
+                deny_categories=list(rp.deny_categories),
+            )
+            # Invariants are pinned, not ranked (doc 03 §1): they are always
+            # included in ambient recall for their scope, budget permitting,
+            # first — delivered because they are in force, not because they
+            # matched the focus. Everything else goes through the gated legs,
+            # which may legitimately admit nothing (ADR-0016).
+            invariants = retrieval.invariants(
+                cur, scope_chain=chain, settings=self.settings, **gates
+            )
             hits = retrieval.search(
                 cur, scope_chain=chain, query=focus,
                 query_embedding=self.embedder.embed(focus) if focus else None,
                 settings=self.settings, include_staged=rp.include_staged,
-                trust_floor=rp.trust_floor, sensitivity_ceiling=rp.sensitivity_ceiling,
-                deny_categories=list(rp.deny_categories), limit=50,
+                weights=rp.weight_map(), limit=50, **gates,
             )
-            invariants = [h for h in hits if h["status"] == "invariant"]
             facts = [h for h in hits if h["status"] == "active"]
             staged = [h for h in hits if h["status"] == "staged"]
 

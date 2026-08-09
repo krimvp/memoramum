@@ -63,6 +63,7 @@ CREATE TABLE memories (
 
 CREATE INDEX ON memories USING hnsw (content_embedding vector_cosine_ops);
 CREATE INDEX ON memories USING gin (content_tsv);
+CREATE INDEX ON memories USING gin (content gin_trgm_ops);   -- literal leg (ADR-0017)
 CREATE INDEX ON memories (scope_id, status);
 CREATE INDEX ON memories USING gin (subject_ids);
 ```
@@ -72,6 +73,7 @@ Notes:
 - **`confidence` vs `trust_score`**: confidence is epistemic ("how sure is the statement true" — set at extraction, adjusted by reinforcement/contradiction); trust is *security* ("how much do we trust the source" — derived from provenance, used as a retrieval floor and the poisoning lever). They move independently: a confidently-extracted fact from an external Slack Connect user is high-confidence, low-trust.
 - **`subject_ids` at write time** is non-negotiable: honoring "what do you know about dana" or a GDPR erasure request must be an index lookup, not a semantic search ([doc 06 §2](06-audit-privacy-security.md)).
 - **`categories`** is the shared vocabulary between memories and the learning policy ([doc 05 §2](05-policy.md)) — policy rules match on it (`deny: credentials`, `ask: health`).
+- **Three retrieval indexes, three legs.** `content_embedding` (HNSW) carries paraphrase, `content_tsv` (GIN) carries stemmed natural language, and the trigram index over raw `content` carries literal tokens — paths, symbol names, workspace and MR ids — that the `english` parser folds into one lexeme and an embedder has no signal for ([ADR-0017](adr/0017-literal-retrieval-leg.md)). `pg_trgm` is therefore a required extension alongside `vector`; the fusion and the per-leg admission gates are [doc 04 §3](04-agent-interface.md).
 - Content is immutable (enforced in the service layer; `profile` kind excepted, every edit evented). Everything below the "belief & security" divider is mutable bookkeeping.
 
 ## 3. Episodes

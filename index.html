@@ -235,8 +235,10 @@
         active facts, then a clearly-fenced <code>[staged]</code> section — every line with a
         provenance hint.</td></tr>
     <tr><td><strong>Deliberate recall</strong></td><td>The agent, mid-task</td>
-        <td><code>memory_recall</code> with a natural-language query — hybrid vector + lexical
-        retrieval, scored by relevance × retention × trust × status × scope proximity.</td></tr>
+        <td><code>memory_recall</code> with a natural-language query — three fused legs (vector,
+        lexical, and a literal one for paths and identifiers), scored by relevance × retention ×
+        trust × status × scope proximity. Each leg gates on absolute relevance, so a query that
+        matches nothing returns nothing.</td></tr>
   </table></div>
   <p>Access control runs <em>before</em> scoring (never post-filtering), and every delivery emits
   a <code>READ</code> event listing the memories that entered context (ADR-0006) — the one log most

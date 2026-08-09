@@ -57,6 +57,9 @@ read:
   include_staged: true
   trust_floor: 0.3
   sensitivity_ceiling: internal
+  weights:
+    status: 2.0
+    scope_proximity: 1.0
 """
 
 

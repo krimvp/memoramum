@@ -51,10 +51,12 @@ Decision recorded in [ADR-0004](adr/0004-postgres-reference-stack.md); summary:
 
 | Concern | Choice | Why |
 |---|---|---|
-| Primary store | **Postgres 16+ with pgvector** | Memories, episodes, events, scopes, policy in *one transactional store*: a write + its provenance + its event commit atomically. HNSW + tsvector give hybrid retrieval natively. RLS as defense-in-depth under the API core. Single-org scale (≤ low millions of memories, ≤ thousands of QPS reads) is comfortably inside Postgres territory. |
+| Primary store | **Postgres 16+ with pgvector and pg_trgm** | Memories, episodes, events, scopes, policy in *one transactional store*: a write + its provenance + its event commit atomically. HNSW + tsvector + trigram give all three retrieval legs natively ([doc 04 §3](04-agent-interface.md), [ADR-0017](adr/0017-literal-retrieval-leg.md)). RLS as defense-in-depth under the API core. Single-org scale (≤ low millions of memories, ≤ thousands of QPS reads) is comfortably inside Postgres territory. |
 | Queue | any boring queue (SQS / Postgres-based) | Debounce and sweeps need at-least-once + delay, nothing exotic. |
 | Policy engine | in-service evaluation over policy tables | ReBAC tables kept SpiceDB/OpenFGA-isomorphic; OPA sidecar as documented escape hatch ([doc 05 §2](05-policy.md), §4). |
 | Facades | MCP server (stdio + streamable HTTP) + REST | [ADR-0005](adr/0005-standalone-service-mcp.md), [ADR-0015](adr/0015-remote-mcp-streamable-http.md). |
+
+**One operational note on the vector leg.** Every retrieval is filtered — by scope chain, status, trust floor ([doc 04 §3](04-agent-interface.md)) — and an HNSW scan applies those filters *after* the index walk, so a selective chain can exhaust the candidate list before it fills K and the leg silently under-returns. The deployment raises `hnsw.ef_search` for retrieval queries and, where the pgvector build offers it, turns on iterative index scans so the walk continues until enough rows survive the filter. This is recall of the index, not of the ranking: the [ADR-0016](adr/0016-absolute-relevance-admission.md) distance ceiling still decides what is relevant enough to keep.
 
 **When to revisit** (the triggers table, so this doesn't ossify):
 

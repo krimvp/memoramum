@@ -78,10 +78,13 @@ retention:
   overrides:                     # per-category TTL / deletion mode
     - { categories: [health], ttl: 90d, expiry_mode: tombstone }
 
-read:
+read:                            # gates (tighten downward) + weights (narrowest setter wins)
   include_staged: true
   trust_floor: 0.3               # minimum trust_score retrievable in this agent's contexts
   sensitivity_ceiling: internal  # this agent's surfaces never see confidential+ memories
+  weights:                       # exponents on the doc 04 §3 factors; 1.0 = default (ADR-0018)
+    status: 2.0                  # bury staged results without excluding them
+    scope_proximity: 1.0
 ```
 
 Semantics:
@@ -161,6 +164,8 @@ Applied to the candidate scope set and to individual memories:
 - `trust_floor` per read context — high-stakes flows (an agent about to take an action) can require `trust_score ≥ 0.7` and `status ≠ staged`;
 - category deny-lists per surface (e.g. nothing categorized `hr_confidential` is ever retrievable by non-HR agents);
 - `as_of`/history queries require an elevated audit role — time travel is an audit feature, not an agent feature.
+
+Those four are **gates**: they decide what may be retrieved at all, and they compose strictest-wins like every other axis here. The `read.weights` block is the other half of §1's `read:` section and is **not** a gate — the [doc 04 §3](04-agent-interface.md) exponents only reorder what the gates already permitted, so "strictest" has no meaning for them and they compose differently: the org layer's weights are final, and below org the narrowest layer that sets a weight wins ([ADR-0018](adr/0018-retrieval-weights-are-policy.md)). Weights can never widen a read; a policy that wants staged memories out of a high-stakes context sets `include_staged: false`, not `weights.status: 0`.
 
 ## 5. Administration
 
