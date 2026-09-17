@@ -397,7 +397,7 @@ class MemoryService:
         # scope chain (doc 03 §3). Judging is LLM-shaped; the judge is a
         # pluggable seam (lifecycle.Judge) — the default 'exact' judge
         # finds no contradictions, leaving the 'wrong' signal and review
-        # queue as the paths in.
+        # queue as the paths in; the 'jev' judge asks System One (ADR-0019).
         embedding = self.embedder.embed(content)
         # A consolidated successor does not contradict what it derives from.
         contradicted = self._find_contradiction(
@@ -482,6 +482,11 @@ class MemoryService:
             key = "contradicts" if hold else "supersedes"
             propose_details[key] = old_id
             response[key] = old_id
+            # A model judge's evidence for this verdict (probabilities,
+            # confidence, model id, usage — ADR-0019) rides on the event.
+            evidence = getattr(self.judge, "last_evidence", None)
+            if evidence:
+                propose_details["judge"] = evidence
 
         self._event(
             cur, principal, "PROPOSE", memory_id=memory_id, scope_id=target_scope,

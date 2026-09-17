@@ -69,9 +69,10 @@ class Settings:
     # (deterministic local embedder — dev/test stand-in for a real model).
     embedder: str = field(default_factory=lambda: os.environ.get("MEMORAMUM_EMBEDDER", "none"))
     # Contradiction judge (doc 03 §3): 'exact' (duplicates only — write-time
-    # contradiction detection off without a model) or 'overlap'
-    # (deterministic dev/test stand-in). A model judge slots in behind the
-    # same interface (lifecycle.Judge).
+    # contradiction detection off without a model), 'overlap'
+    # (deterministic dev/test stand-in) or 'jev' (the System One judge,
+    # ADR-0019 — needs TYPESAFE_API_KEY, checked at startup). All behind
+    # the same interface (lifecycle.Judge).
     judge: str = field(default_factory=lambda: os.environ.get("MEMORAMUM_JUDGE", "exact"))
     # PII analyzer (doc 06 §4): 'regex' (deterministic pattern stand-in for
     # a Presidio-class model — same seam) or 'none' (scanning off).

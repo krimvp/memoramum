@@ -55,6 +55,7 @@ Decision recorded in [ADR-0004](adr/0004-postgres-reference-stack.md); summary:
 | Queue | any boring queue (SQS / Postgres-based) | Debounce and sweeps need at-least-once + delay, nothing exotic. |
 | Policy engine | in-service evaluation over policy tables | ReBAC tables kept SpiceDB/OpenFGA-isomorphic; OPA sidecar as documented escape hatch ([doc 05 §2](05-policy.md), §4). |
 | Facades | MCP server (stdio + streamable HTTP) + REST | [ADR-0005](adr/0005-standalone-service-mcp.md), [ADR-0015](adr/0015-remote-mcp-streamable-http.md). |
+| Contradiction judge | System One `choice` question (`MEMORAMUM_JUDGE=jev`, key in `TYPESAFE_API_KEY`); deterministic dev judges otherwise | One ~0.5 s call per candidate with neighbors, calibrated probabilities instead of a written verdict, gated at 0.8 confidence, fails closed to `unrelated` ([doc 03 §3](03-lifecycle.md), [ADR-0019](adr/0019-system-one-contradiction-judge.md)). The service refuses to start without the key rather than failing at write time. |
 
 **One operational note on the vector leg.** Every retrieval is filtered — by scope chain, status, trust floor ([doc 04 §3](04-agent-interface.md)) — and an HNSW scan applies those filters *after* the index walk, so a selective chain can exhaust the candidate list before it fills K and the leg silently under-returns. The deployment raises `hnsw.ef_search` for retrieval queries and, where the pgvector build offers it, turns on iterative index scans so the walk continues until enough rows survive the filter. This is recall of the index, not of the ranking: the [ADR-0016](adr/0016-absolute-relevance-admission.md) distance ceiling still decides what is relevant enough to keep.
 
@@ -88,6 +89,7 @@ Decision recorded in [ADR-0004](adr/0004-postgres-reference-stack.md); summary:
 | Policy engine unreachable | **Fail closed** for writes (queue and retry), fail closed for reads beyond the requesting principal's own `agent:*` scope. |
 | Membership sync stale | Retrieval uses last-synced membership with a staleness bound (default 5 min); beyond the bound, private-trust-class scopes fail closed, others serve with staleness noted in the event. |
 | Classifier/extraction model regression | Versions recorded in provenance; reclassification sweep + quarantine-by-activity available ([doc 06](06-audit-privacy-security.md)). |
+| Contradiction judge unreachable or under-confident | **Fail closed** to `unrelated`: the write lands as it would with the `exact` judge, a warning is logged, no supersession happens. The held-contradiction queue, the `wrong` signal and the consolidator catch what the write path missed ([doc 03 §3](03-lifecycle.md)). |
 
 ## 6. Phased rollout
 

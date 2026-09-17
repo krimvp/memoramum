@@ -5,15 +5,23 @@ This module holds the *rules*; the service (write path, `memory_reinforce`)
 and the consolidator (batch jobs, doc 07 §2) apply them and emit the
 events. Judging whether two memories state conflicting facts is LLM-shaped
 work; like the embedder, it hides behind a one-method interface with
-deterministic local implementations for dev and tests. A real model judge
-slots in behind the same seam.
+deterministic local implementations for dev and tests. The System One
+judge (`jev`, ADR-0019) is the model judge behind the same seam.
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import re
+import threading
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
+
+log = logging.getLogger(__name__)
 
 # Strength increments per reinforcement signal (doc 03 §5): useful
 # retrieval +1, re-observation +2, explicit confirm +5. Reinforcement also
@@ -64,12 +72,122 @@ class OverlapJudge:
         return "contradiction" if overlap >= self.threshold else "unrelated"
 
 
+JEV_URL = "https://api.typesafe.ai/v1/systemone"
+JEV_MODEL = "jev-latest"
+JEV_KEY_VAR = "TYPESAFE_API_KEY"
+JEV_TIMEOUT_SECONDS = 10
+# The verdict must reach this confidence before it counts. A false
+# contradiction supersedes a good memory (invisible until someone misses
+# it); a missed one only delays supersession — the consolidator, the
+# 'wrong' signal and the review queue remain the paths in. Asymmetric
+# harm, so the gate is high.
+JEV_CONFIDENCE_GATE = 0.8
+
+# The one question, in doc 03 §3's terms. `unrelated` is the safe default:
+# it is what every fault and every under-confident answer becomes.
+JEV_CRITERIA = {
+    "duplicate": "Both memories state the same fact; the new memory only restates "
+                 "the old one (same subject, same claim), possibly in other words.",
+    "contradiction": "Both memories are about the same subject and both cannot hold "
+                     "at once; if the new memory is true, the old memory is no "
+                     "longer true and the new one supersedes it.",
+    "unrelated": "The new memory states a different fact: another subject, or a "
+                 "claim that can hold together with the old one.",
+}
+JEV_INSTRUCTIONS = (
+    "Two memories of an AI agent about a team or a person. Compare new_memory "
+    "with old_memory: does the new memory restate the old one, contradict it, "
+    "or state a different fact?"
+)
+
+
+class JevJudge:
+    """The System One judge (ADR-0019): one `choice` question over the pair,
+    answered with calibrated probabilities instead of a written verdict.
+    Fails closed — no key stops the service at startup; a fault or an
+    answer below JEV_CONFIDENCE_GATE is 'unrelated', so the write continues
+    exactly as with the exact judge. The evidence of the last verdict on
+    this thread (probabilities, confidence, model id, usage) is kept in
+    `last_evidence` so the write path can record it (PROPOSE details)."""
+
+    def __init__(self, api_key: str, url: str = JEV_URL):
+        self.api_key = api_key
+        self.url = url
+        self._local = threading.local()
+
+    @property
+    def last_evidence(self) -> dict[str, Any] | None:
+        return getattr(self._local, "evidence", None)
+
+    def judge(self, new_content: str, old_content: str) -> str:
+        self._local.evidence = None
+        body = json.dumps({
+            "model": JEV_MODEL,
+            "state": {"old_memory": old_content, "new_memory": new_content},
+            "questions": {"relation": {"type": "choice", "instructions": JEV_INSTRUCTIONS,
+                                       "criteria": JEV_CRITERIA}},
+        }).encode()
+        req = urllib.request.Request(
+            self.url, data=body, method="POST",
+            headers={"Authorization": f"Bearer {self.api_key}",
+                     "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=JEV_TIMEOUT_SECONDS) as resp:
+                answer = parse_jev_answer(json.loads(resp.read()))
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+            # URLError covers HTTPError (401/422/429/529); ValueError covers
+            # bad JSON and every schema mismatch parse_jev_answer raises.
+            log.warning("jev judge unavailable, verdict falls to 'unrelated': %s", e)
+            return "unrelated"
+        self._local.evidence = answer
+        if answer["confidence"] < JEV_CONFIDENCE_GATE:
+            return "unrelated"
+        return answer["choice"]
+
+
+def parse_jev_answer(data: Any) -> dict[str, Any]:
+    """Explicit shape check of the System One response; ValueError on any
+    mismatch. Returns the evidence record: choice, confidence,
+    probabilities, model, usage."""
+    if not isinstance(data, dict) or not isinstance(data.get("answers"), dict):
+        raise ValueError("response has no 'answers' object")
+    ans = data["answers"].get("relation")
+    if not isinstance(ans, dict) or ans.get("type") != "choice":
+        raise ValueError("answer 'relation' is not a choice answer")
+    choice, confidence, probs = ans.get("choice"), ans.get("confidence"), ans.get("probabilities")
+    if choice not in JEV_CRITERIA:
+        raise ValueError(f"unknown choice {choice!r}")
+    if not _is_probability(confidence):
+        raise ValueError(f"confidence {confidence!r} is not a probability")
+    if (not isinstance(probs, dict) or set(probs) != set(JEV_CRITERIA)
+            or not all(_is_probability(v) for v in probs.values())):
+        raise ValueError("probabilities do not cover exactly the three criteria")
+    model, usage = data.get("model"), data.get("usage")
+    if not isinstance(model, str) or not model:
+        raise ValueError("response names no model")
+    if not isinstance(usage, dict):
+        raise ValueError("response has no usage")
+    return {"judge": "jev", "choice": choice, "confidence": float(confidence),
+            "probabilities": {k: float(v) for k, v in probs.items()},
+            "model": model, "usage": usage}
+
+
+def _is_probability(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= v <= 1.0
+
+
 def make_judge(name: str) -> Judge:
     if name == "exact":
         return ExactJudge()
     if name == "overlap":
         return OverlapJudge()
-    raise ValueError(f"unknown judge {name!r} (expected 'exact' or 'overlap')")
+    if name == "jev":
+        key = os.environ.get(JEV_KEY_VAR, "").strip()
+        if not key:
+            raise ValueError(f"judge 'jev' needs the {JEV_KEY_VAR} environment variable")
+        return JevJudge(key)
+    raise ValueError(f"unknown judge {name!r} (expected 'exact', 'overlap' or 'jev')")
 
 
 # ---------- supersede vs hold (doc 03 §3, invariant: staged input can
